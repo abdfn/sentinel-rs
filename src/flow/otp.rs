@@ -7,6 +7,7 @@
 //!
 //! 取码页是"最新在前"的卡片列表，所以按文档顺序取第一个满足条件的即可。
 
+use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 
 /// 从任意文本里取第一个 6 位验证码（前后不能紧邻数字）。
@@ -198,9 +199,18 @@ pub fn select_fresh_otp(
     after_ts: Option<i64>,
     baseline: &HashSet<String>,
 ) -> Option<String> {
-    for card in parse_cards(html) {
+    select_fresh_otp_from_cards(&parse_cards(html), after_ts, baseline)
+}
+
+/// [`select_fresh_otp`] 的卡片版（HTML / JSON 两条解析路径共用同一套挑选规则）。
+pub fn select_fresh_otp_from_cards(
+    cards: &[InboxCard],
+    after_ts: Option<i64>,
+    baseline: &HashSet<String>,
+) -> Option<String> {
+    for card in cards {
         let Some(code) = card.otp() else { continue };
-        match card_timestamp(&card) {
+        match card_timestamp(card) {
             Some(ts) => {
                 let fresh = match after_ts {
                     Some(after) => ts >= after - 5,
@@ -218,6 +228,124 @@ pub fn select_fresh_otp(
         }
     }
     None
+}
+
+// ─────────────────────────── JSON 取码页 ───────────────────────────
+//
+// 有些邮箱服务不吐 HTML 卡片，直接返回 JSON（例如
+// `{"data":[{"subject":"…","content":"… 123456 …","created_at":"2026-11-02 10:00:00"}]}`）。
+// 这里把任意 JSON 规约成同一套 [`InboxCard`]，后面的新鲜度判定完全复用。
+
+/// JSON 里优先当作验证码文本的字段名（按此顺序找）。
+const CODE_KEYS: [&str; 12] = [
+    "code",
+    "otp",
+    "verification_code",
+    "verify_code",
+    "content",
+    "body",
+    "text",
+    "html",
+    "subject",
+    "snippet",
+    "preview",
+    "message",
+];
+
+/// JSON 里可能是时间的字段名。
+const TIME_KEYS: [&str; 11] = [
+    "time",
+    "date",
+    "datetime",
+    "date_time",
+    "created_at",
+    "createdat",
+    "received_at",
+    "receivedat",
+    "sent_at",
+    "sentat",
+    "timestamp",
+];
+
+/// 按内容判断是 JSON 还是 HTML，再走对应解析。
+pub fn parse_cards_any(body: &str) -> Vec<InboxCard> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<JsonValue>(trimmed) {
+            return parse_cards_json(&value);
+        }
+    }
+    parse_cards(body)
+}
+
+/// 把 JSON 响应规约成邮件卡片列表（数组顺序 = 服务端顺序，最新在前）。
+pub fn parse_cards_json(value: &JsonValue) -> Vec<InboxCard> {
+    let mut cards = Vec::new();
+    collect_json_cards(value, &mut cards);
+    cards
+}
+
+fn collect_json_cards(value: &JsonValue, out: &mut Vec<InboxCard>) {
+    match value {
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_json_cards(item, out);
+            }
+        }
+        JsonValue::Object(map) => {
+            let lower: Vec<(String, &JsonValue)> = map
+                .iter()
+                .map(|(key, val)| (key.to_ascii_lowercase(), val))
+                .collect();
+            let lookup = |name: &str| {
+                lower
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, val)| *val)
+            };
+
+            let mut codes: Vec<String> = Vec::new();
+            for key in CODE_KEYS {
+                if let Some(JsonValue::String(text)) = lookup(key) {
+                    if extract_otp(text).is_some() {
+                        codes.push(text.clone());
+                    }
+                }
+            }
+            // 常见字段都没命中才扫其余字符串，避免把 id / 时间戳当验证码。
+            if codes.is_empty() {
+                for (key, val) in &lower {
+                    if CODE_KEYS.contains(&key.as_str()) || TIME_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    if let JsonValue::String(text) = val {
+                        if extract_otp(text).is_some() {
+                            codes.push(text.clone());
+                        }
+                    }
+                }
+            }
+
+            if codes.is_empty() {
+                // 这一层只是包装（`{"data":[…]}` 之类），继续往下钻。
+                for (_, val) in &lower {
+                    collect_json_cards(val, out);
+                }
+                return;
+            }
+
+            let mut meta = Vec::new();
+            for key in TIME_KEYS {
+                match lookup(key) {
+                    Some(JsonValue::String(text)) => meta.push(text.clone()),
+                    Some(JsonValue::Number(num)) => meta.push(num.to_string()),
+                    _ => {}
+                }
+            }
+            out.push(InboxCard { meta, codes });
+        }
+        _ => {}
+    }
 }
 
 /// 卡片里最早出现的可解析时间戳（unix 秒）。
@@ -239,7 +367,24 @@ pub fn parse_meta_timestamp(raw: &str) -> Option<i64> {
                 .map(|pos| raw[pos + key.len()..].trim_start_matches([':', '：', ' ', '\t']))
         })
         .unwrap_or(raw);
+    if let Some(ts) = parse_unix_timestamp(payload) {
+        return Some(ts);
+    }
     parse_datetime_prefix(payload)
+}
+
+/// 纯数字 unix 时间戳：10 位按秒、13 位按毫秒（JSON 取码页常见）。
+fn parse_unix_timestamp(text: &str) -> Option<i64> {
+    let digits = text.trim().trim_end_matches(['Z', 'z']);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let value: i64 = digits.parse().ok()?;
+    match digits.len() {
+        10 => Some(value),
+        13 => Some(value / 1000),
+        _ => None,
+    }
 }
 
 fn parse_datetime_prefix(text: &str) -> Option<i64> {

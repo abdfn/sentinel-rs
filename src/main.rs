@@ -38,11 +38,78 @@ fn run() -> Result<()> {
         }
         "mint" => cmd_mint(rest),
         "register" => cmd_register(rest),
+        "2fa" => cmd_enable_2fa(rest),
         other => {
             print_help();
-            bail!("未知子命令: {other:?}（可选：mint / register / help）")
+            bail!("未知子命令: {other:?}（可选：mint / register / 2fa / help）")
         }
     }
+}
+
+// ─────────────────────────── 2fa（补绑已有账号）───────────────────────────
+
+fn cmd_enable_2fa(argv: &[String]) -> Result<()> {
+    let mut cfg = RegisterConfig::from_env()?;
+    let mut only: Option<String> = None;
+
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--db" => {
+                cfg.db_path = std::path::PathBuf::from(iter.next().context("--db 需要一个路径")?);
+            }
+            "--proxy" => {
+                let raw = iter.next().context("--proxy 需要一个地址")?.to_string();
+                flow::http::normalize_proxy_url(&raw)?;
+                cfg.proxy = Some(raw);
+            }
+            "--email" => {
+                only = Some(iter.next().context("--email 需要一个地址")?.to_string());
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            other => bail!("2fa 未识别的参数: {other:?}"),
+        }
+    }
+
+    init_tracing();
+
+    println!("== 2FA 补绑 ==");
+    println!("  数据库    : {}", cfg.db_path.display());
+    println!("  范围      : {}", only.as_deref().unwrap_or("<全部已注册账号>"));
+    println!(
+        "  代理      : {}",
+        if cfg.proxy_pool.is_empty() {
+            cfg.proxy.clone().unwrap_or_else(|| "<直连>".to_string())
+        } else {
+            format!("代理池 {} 个", cfg.proxy_pool.len())
+        }
+    );
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("创建 tokio runtime 失败")?;
+    let outcomes = runtime
+        .block_on(flow::enable_2fa(&cfg, only.as_deref()))
+        .context("2FA 补绑失败")?;
+
+    let mut done = 0usize;
+    for item in &outcomes {
+        if item.status.starts_with("已启用") {
+            done += 1;
+        }
+        println!(
+            "  {}  {}  {}",
+            item.email,
+            item.status,
+            item.secret.as_deref().unwrap_or("-")
+        );
+    }
+    println!("\n== 汇总 ==  成功 {done} / 共 {} 个", outcomes.len());
+    Ok(())
 }
 
 // ─────────────────────────── mint ───────────────────────────
@@ -290,6 +357,7 @@ fn cmd_register(argv: &[String]) -> Result<()> {
                 cfg.proxy = Some(raw);
             }
             "--2fa" => cfg.enable_2fa = true,
+            "--no-2fa" => cfg.enable_2fa = false,
             "--concurrency" | "-c" => {
                 let raw = iter.next().context("--concurrency 需要一个数字")?;
                 concurrency = raw
@@ -323,23 +391,35 @@ fn cmd_register(argv: &[String]) -> Result<()> {
         cfg.fingerprint = cfg.resolve_fingerprint();
     }
 
+    cfg.require_live_prerequisites()?;
+
     println!("== 注册配置 ==");
     println!("  模式      : {}", if cfg.dry_run { "dry-run（不联网）" } else { "LIVE（真实联网注册）" });
     println!("  数量      : {}", cfg.count);
-    println!("  代理      : {}", cfg.proxy.as_deref().unwrap_or("<直连>"));
     println!(
-        "  邮箱 API  : {}",
-        cfg.email_api
-            .as_ref()
-            .map(|api| api.base_url.as_str())
-            .unwrap_or("<未配置：REG_MAIL_API_BASE_URL>")
+        "  代理      : {}",
+        match (cfg.proxy_pool.is_empty(), cfg.proxy.as_deref()) {
+            (false, _) => format!("代理池 {} 个（第 i 个号用第 i 个）", cfg.proxy_pool.len()),
+            (true, Some(proxy)) => proxy.to_string(),
+            (true, None) => "<直连>".to_string(),
+        }
     );
+    match (cfg.mail_entries.first(), &cfg.email_api) {
+        (Some(fixed), _) => println!(
+            "  邮箱      : 固定 {} 个（首个 {} → {}）",
+            cfg.mail_entries.len(),
+            fixed.email,
+            flow::email::redact_url(&fixed.code_url)
+        ),
+        (None, Some(api)) => println!("  邮箱 API  : {}", api.base_url),
+        (None, None) => println!(
+            "  邮箱      : <未配置：REG_MAIL_ENTRY 或 REG_MAIL_API_BASE_URL>"
+        ),
+    }
     println!("  2FA       : {}", if cfg.enable_2fa { "enroll+activate" } else { "关闭" });
     println!("  数据库    : {}", cfg.db_path.display());
     println!("  取码超时  : {}s（间隔 {}s）", cfg.otp_max_wait_secs, cfg.otp_poll_interval_secs);
     println!("  指纹      : {}", fingerprint_line(&cfg));
-
-    cfg.require_live_prerequisites()?;
 
     if cfg.preflight {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -369,33 +449,36 @@ fn cmd_register(argv: &[String]) -> Result<()> {
         let (okn, failedn) = runtime.block_on(async {
             let mut ok = 0usize;
             let mut failed = 0usize;
-            let mut done = 0usize;
-            while done < cfg.count {
-                let batch = (cfg.count - done).min(concurrency);
+            let mut started = 0usize;
+            while started < cfg.count {
+                let batch = (cfg.count - started).min(concurrency);
                 let mut set: tokio::task::JoinSet<anyhow::Result<flow::RegistrationOutcome>> =
                     tokio::task::JoinSet::new();
-                for _ in 0..batch {
+                for k in 0..batch {
                     let c = cfg.clone();
-                    set.spawn(async move { flow::register_once(&c).await });
+                    let idx = started + k;
+                    set.spawn(async move { flow::register_once_at(&c, idx).await });
                 }
+                let mut completed = started;
                 for _ in 0..batch {
-                    done += 1;
+                    completed += 1;
                     match set.join_next().await {
                         Some(Ok(Ok(o))) => {
                             ok += 1;
-                            println!("[{done}/{}] OK   {}", cfg.count, o.email);
+                            println!("[{completed}/{}] OK   {}", cfg.count, o.email);
                         }
                         Some(Ok(Err(err))) => {
                             failed += 1;
-                            println!("[{done}/{}] FAIL {err:#}", cfg.count);
+                            println!("[{completed}/{}] FAIL {err:#}", cfg.count);
                         }
                         Some(Err(err)) => {
                             failed += 1;
-                            println!("[{done}/{}] JOIN-ERR {err}", cfg.count);
+                            println!("[{completed}/{}] JOIN-ERR {err}", cfg.count);
                         }
                         None => break,
                     }
                 }
+                started += batch;
             }
             (ok, failed)
         });
@@ -410,7 +493,7 @@ fn cmd_register(argv: &[String]) -> Result<()> {
 
     for index in 1..=cfg.count {
         println!("\n-- [{index}/{}] --", cfg.count);
-        match runtime.block_on(flow::register_once(&cfg)) {
+        match runtime.block_on(flow::register_once_at(&cfg, index - 1)) {
             Ok(outcome) => {
                 ok += 1;
                 if outcome.dry_run {
@@ -421,11 +504,14 @@ fn cmd_register(argv: &[String]) -> Result<()> {
                     println!("占位身份: {}（密码长度 {}）", outcome.email, outcome.password.len());
                 } else {
                     println!(
-                        "注册完成: {}  account_id={:?}  access_token={}  2fa={}",
+                        "注册完成: {}  account_id={:?}  access_token={}  2fa={}  流量≈{:.0}KB(↑{:.0}/↓{:.0})",
                         outcome.email,
                         outcome.account_id,
                         if outcome.access_token.is_some() { "有" } else { "无" },
-                        outcome.totp_secret.is_some()
+                        outcome.totp_secret.is_some(),
+                        (outcome.traffic_sent + outcome.traffic_recv) as f64 / 1024.0,
+                        outcome.traffic_sent as f64 / 1024.0,
+                        outcome.traffic_recv as f64 / 1024.0
                     );
                 }
             }
@@ -488,6 +574,7 @@ fn print_help() {
 命令:
   mint        解码 challenge，生成 sentinel token（可选同时生成 SO token）
   register    跑注册流程；默认 dry-run，只打印计划（含真实 sentinel 步骤），不联网
+  2fa         给库里已注册的账号补绑 TOTP（只需 access_token）
   help        显示本帮助（等价 --help / -h）
 
 全局:
@@ -506,11 +593,17 @@ register 选项:
   -n, --count <N> 注册数量（默认取 SENTINEL_COUNT，缺省 1）
   --db <PATH>     SQLite 路径（默认 data/sentinel-rs.db）
   --proxy <URL>   代理，支持 host:port 或 http://user:pass@host:port
-  --2fa           注册后 enroll+activate TOTP
+  --2fa           注册后 enroll+activate TOTP（默认开启，等价于不写）
+  --no-2fa        本次不绑 TOTP（覆盖默认开启）
   --dry-run       只构造请求计划（默认行为）
   --preflight     只验证 authorize 会话（warmup → signin → authorize init），
                   不领邮箱、不注册、不发码；用来确认 live 链路状态是否正常
   --live          真实联网注册（危险：会真的建号，需自备邮箱 API 与 sentinel token 源）
+
+2fa 选项:
+  --db <PATH>     SQLite 路径（默认 data/sentinel-rs.db）
+  --proxy <URL>   代理
+  --email <ADDR>  只处理这一个账号（默认处理库里全部已注册账号）
 
 环境变量（.env 亦可）:
   SENTINEL_PROXY / HTTPS_PROXY / ALL_PROXY   代理
@@ -518,7 +611,7 @@ register 选项:
   REG_MAIL_ALLOW_INSECURE                     1 放行回环 http://（本地自建 / mock）
   SENTINEL_COUNT / REGISTER_COUNT            默认数量
   SENTINEL_DB_PATH                           默认数据库路径
-  SENTINEL_ENABLE_2FA                        1/true 开启 2FA
+  SENTINEL_ENABLE_2FA                        0/false 关闭 2FA（默认开启）
   OTP_MAX_WAIT / OTP_POLL_INTERVAL           取码超时 / 轮询间隔（秒）
   SENTINEL_LIVE_REGISTER                     1 才允许真实联网注册
   SENTINEL_USER_AGENT / SENTINEL_ACCEPT_LANGUAGE  显式指定 UA / 语言（给定时不做随机指纹）

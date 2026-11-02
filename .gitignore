@@ -6,3 +6,9 @@ __pycache__/
 
 # 构建产物（dist 里放的是本地编译的 exe，不进版本库）
 /dist
+
+# 本地运营数据：邮箱池 / 代理池（含 key、账号密码），绝不入库
+mail.txt
+proxy.txt
+*.local.txt
+.env

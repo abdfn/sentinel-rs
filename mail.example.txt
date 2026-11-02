@@ -1,0 +1,4 @@
+# 邮箱池示例：复制成 mail.txt 后填真实数据（mail.txt 已被 .gitignore 忽略）
+# 每行一条：email----code_url
+user1@example.com----https://mail.example.com/api/v1/mail/recent?api_key=YOUR_KEY_1
+user2@example.com----https://mail.example.com/api/v1/mail/recent?api_key=YOUR_KEY_2

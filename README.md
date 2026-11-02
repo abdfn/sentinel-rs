@@ -85,7 +85,7 @@ $env:TURB_WREQ_EMULATION = "Chrome146"
 | `REG_MAIL_API_BASE_URL` | 邮箱取码 API 基地址（必填，`https://`） | 无 → 不能 `--live` |
 | `REG_MAIL_API_TOKEN` | 邮箱 API bearer token（可选） | 空 → 不发鉴权头 |
 | `REG_MAIL_ALLOW_INSECURE` | `1` 放行回环 `http://`（本地自建 / mock） | `0` |
-| `SENTINEL_ENABLE_2FA` | 注册后 enroll + activate TOTP | `0` |
+| `SENTINEL_ENABLE_2FA` | 注册后 enroll + activate TOTP | `1`（默认开启；`0/false/off` 关闭） |
 | `OTP_MAX_WAIT` / `OTP_POLL_INTERVAL` | 取码等待上限 / 轮询间隔（秒） | `180` / `3` |
 | `SENTINEL_DB_PATH` | SQLite 路径 | `data/sentinel-rs.db` |
 | `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 显式指定 UA / 语言；**给定时不做随机指纹** | 每次注册随机生成（见下节） |
@@ -158,16 +158,98 @@ $env:SENTINEL_FP_COUNTRY="JP"; .\target\release\sentinel-rs.exe register -n 1
 `[fp] … ua=<本次实际使用的 UA>`，可以直接对照。多账号（`-n > 1`）**每个账号各生成一套**，
 配置打印那一行显示的是"每账号独立生成"。
 
+## 控制台
+
+一个零依赖的本地看板，展示**邮箱池 / 账号池 / 代理池**，并支持代理池配置与套餐刷新：
+
+```powershell
+# 先把示例文件复制成自己的（mail.txt / proxy.txt 已被 .gitignore 忽略，不会进仓库）
+copy mail.example.txt  mail.txt
+copy proxy.example.txt proxy.txt
+
+docker compose up -d web
+# 打开 http://127.0.0.1:8790
+
+# 或者直接用本机 Python
+python web/app.py --port 8790
+```
+
+- 数据来源：`data/sentinel-rs.db`（账号 + 代理池）、`mail.txt`（邮箱池）、`proxy.txt`（代理池种子）；
+  可用 `SENTINEL_DB_PATH` / `MAIL_FILE` / `PROXY_FILE` 覆盖路径；
+- 前端只拿到脱敏后的 token / TOTP / 代理账号，明文不出后端；
+- **账号池**显示套餐（`plan_type` / `plan_display_name`）和**真优惠**标记：
+  只有 `entitlement.discount` / `applied_discounts` / `eligible_promo_campaigns` /
+  `promo_data` / `entitlement.trial` 任一非空才显示「有优惠」（悬停看明细），否则显示「无」；
+  另保留 `is_trial` 显示「试用中」。支持单号或一键刷新；
+- **代理池**在页面上增删/启停，落 SQLite `proxy_pool` 表；注册时如果没显式配
+  `SENTINEL_PROXY_POOL(_FILE)`，CLI 会**自动读取表里启用的代理**，按顺序分配给每个号；
+- 邮箱池会自动和账号池对账，标出"已注册 #id"与 2FA 状态；
+- 10 秒自动刷新，三张表都支持搜索过滤。
+
+## 已注册账号补绑 2FA
+
+已注册的号想补 TOTP，不用重跑注册：
+
+```powershell
+.\target\release\sentinel-rs.exe 2fa              # 处理库里全部账号
+.\target\release\sentinel-rs.exe 2fa --email a@b.c # 只处理一个
+docker run --rm -v ./data:/data sentinel-rs:local 2fa
+```
+
+- 需要库里同时有 `access_token` 和密码（注册时都写了）；
+- 服务端对 enroll 有 `recent_auth_required` 门槛：代码会自动用密码走一遍
+  `authorize → password/verify` 重新登录，再 enroll → activate，最后把 secret 写回库；
+- 已经绑过的会跳过（secret 取不回来，重复 enroll 只会报错）。
+
 ## 邮箱 API 契约
 
 邮箱层只认下面这一个 HTTP 契约，服务端可以是任何实现（自建服务、云函数、现成临时邮箱服务的包装）。
 `src/flow/email.rs` 是唯一实现，没有其它邮箱凭据来源。
 
+### 固定邮箱（不领新地址）
+
+手上已经有一个能收信的地址、且它有现成的取码接口时，直接给一行：
+
+```powershell
+$env:REG_MAIL_ENTRY="your-name@example.com----https://mail.example.com/api/v1/mail/recent?api_key=xxx"
+```
+
+**批量**（一个号一条，第 i 个账号用第 i 条）：
+
+```powershell
+# mail.txt 每行一条，空行和 # 注释忽略
+$env:REG_MAIL_ENTRY_FILE="D:\path\to\mail.txt"
+$env:SENTINEL_COUNT="10"
+```
+
+- 分隔符是 **4 个连字符**（邮箱里的 `+` / `-` 不受影响，取码地址的查询串原样保留）；
+- 设了就**跳过 `POST /mailboxes`**，用这个地址注册、从这个 `code_url` 轮询取码；
+- 与 `REG_MAIL_API_BASE_URL` 同时存在时以本项为准；邮箱数量必须 ≥ 注册数量；
+- 取码地址必须是 `https://`（回环 `http://` 仍需 `REG_MAIL_ALLOW_INSECURE=1`）；
+- 文件可用 UTF-8（带不带 BOM 都行，解析时会剥掉）。
+
+### 代理池（一个号一个出口）
+
+三种来源，优先级从高到低：
+
+1. `SENTINEL_PROXY_POOL`：内联，`;` 分隔；
+2. `SENTINEL_PROXY_POOL_FILE`：文件，每行一条；
+3. **SQLite `proxy_pool` 表**：控制台里配的那份（只取 `enabled=1`）——两处都没配时自动生效。
+
+```powershell
+$env:SENTINEL_PROXY_POOL_FILE="D:\path\to\proxy.txt"   # 每行一条
+# 或直接内联：$env:SENTINEL_PROXY_POOL="host:port:user:pass;host:port:user:pass"
+```
+
+支持三种行格式：`host:port`、`host:port:user:pass`、`scheme://[user:pass@]host:port`。
+第 i 个账号用第 i 条代理（条数不够按取模轮转）；不配代理池则用 `SENTINEL_PROXY`。
+
 ### 环境变量
 
 | 变量 | 必需 | 说明 |
 | --- | --- | --- |
-| `REG_MAIL_API_BASE_URL` | ✅ | 基地址，**必须 `https://`**。本地自建 / mock 用 `http://127.0.0.1:PORT/...` 时必须同时设置 `REG_MAIL_ALLOW_INSECURE=1`（只放行回环地址，其它 `http://` 一律拒绝） |
+| `REG_MAIL_ENTRY` | 二选一 | 固定邮箱 `email----code_url`，跳过领邮箱 API |
+| `REG_MAIL_API_BASE_URL` | 二选一 | 领邮箱模式基地址，**必须 `https://`**。本地自建 / mock 用 `http://127.0.0.1:PORT/...` 时必须同时设置 `REG_MAIL_ALLOW_INSECURE=1`（只放行回环地址，其它 `http://` 一律拒绝） |
 | `REG_MAIL_API_TOKEN` | 否 | 非空时每个请求带 `Authorization: Bearer <token>`；留空则不发鉴权头 |
 | `REG_MAIL_ALLOW_INSECURE` | 否 | `1`/`true`/`yes`/`on` 才放行回环 `http://`（本地 mock 的逃生门） |
 
@@ -190,7 +272,9 @@ Content-Type: application/json
 
 **2）取验证码 —— `GET {code_url}`**
 
-返回 `text/html` 取码页，**最新在前**，每封邮件一张卡片：
+两种响应都认，自动按正文判断（以 `{` / `[` 开头按 JSON，否则按 HTML）。
+
+**HTML 取码页**，**最新在前**，每封邮件一张卡片：
 
 ```html
 <article>
@@ -199,12 +283,19 @@ Content-Type: application/json
 </article>
 ```
 
+**JSON 邮件接口**（任意嵌套，数组顺序即"最新在前"），例如：
+
+```json
+{"code":0,"data":[{"subject":"Your verification code","content":"Enter this code: 123456","created_at":"2026-10-29 10:00:00"}]}
+```
+
 客户端只看两样东西：
 
-- `class="meta"` 里的时间（`时间：YYYY-MM-DD HH:MM:SS` / `Time: ...` / 纯 ISO 都行，按 UTC 解析）；
-  带时间的卡片要求时间 ≥ 发码时刻（5 秒容差），用来过滤旧码；
-- `class="code"` 里的文本，从中取第一个 6 位数字（前后不能紧邻数字）。
-  没有 `meta` 的卡片按"首次出现"判定（发码前已存在的码会被忽略）。
+- 时间字段（`time` / `date` / `created_at` / `timestamp` …，格式 `YYYY-MM-DD HH:MM:SS`、ISO、
+  10 位秒或 13 位毫秒 unix 时间戳）；带时间的条目要求时间 ≥ 发码时刻（5 秒容差），用来过滤旧码；
+- 验证码文本（`code` / `otp` / `content` / `body` / `text` / `html` / `subject` 等，
+  HTML 则是 `class="code"`），从中取第一个 6 位数字（前后不能紧邻数字）。
+  没有时间字段的条目按"首次出现"判定（发码前已存在的码会被忽略）。
 
 **3）可选自检 —— `GET {base}/health`**
 

@@ -1,0 +1,57 @@
+services:
+  # 参考邮箱服务（mock，验证邮箱契约用）
+  mail:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./tools/mock_mail.py:/app/mock_mail.py:ro
+    command: ["python", "mock_mail.py", "--host", "0.0.0.0", "--port", "8899"]
+    ports:
+      - "8899:8899"
+
+  # 只读控制台：展示邮箱池 / 账号池 / 代理池
+  web:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./web:/app:ro
+      - ./data:/data
+      - ./mail.txt:/config/mail.txt:ro
+      - ./proxy.txt:/config/proxy.txt:ro
+    environment:
+      SENTINEL_DB_PATH: /data/sentinel-rs.db
+      MAIL_FILE: /config/mail.txt
+      PROXY_FILE: /config/proxy.txt
+    command: ["python", "app.py", "--host", "0.0.0.0", "--port", "8790"]
+    ports:
+      - "8790:8790"
+
+  # 主程序
+  sentinel:
+    build: .
+    image: sentinel-rs:local
+    depends_on:
+      - mail
+    # 与 mail 共享网络命名空间：邮箱 API 走 127.0.0.1 就是真回环，
+    # 满足 REG_MAIL_ALLOW_INSECURE=1 的"只放行回环"校验
+    network_mode: "service:mail"
+    environment:
+      SENTINEL_DB_PATH: /data/sentinel-rs.db
+      SENTINEL_LOG: ${SENTINEL_LOG:-info}
+      # 默认 dry-run；真跑要 SENTINEL_LIVE_REGISTER=1 + 邮箱/代理配置
+      SENTINEL_LIVE_REGISTER: ${SENTINEL_LIVE_REGISTER:-0}
+      REG_MAIL_ALLOW_INSECURE: "1"
+      REG_MAIL_API_BASE_URL: ${REG_MAIL_API_BASE_URL:-http://127.0.0.1:8899/api/v1}
+      # 固定邮箱：email----code_url（设了就走它，跳过领邮箱 API）
+      REG_MAIL_ENTRY: ${REG_MAIL_ENTRY:-}
+      # 批量：每行一条 email----code_url
+      REG_MAIL_ENTRY_FILE: ${REG_MAIL_ENTRY_FILE:-}
+      # 代理池：每行一条 host:port:user:pass
+      SENTINEL_PROXY_POOL_FILE: ${SENTINEL_PROXY_POOL_FILE:-}
+      REG_MAIL_API_TOKEN: ${REG_MAIL_API_TOKEN:-}
+      SENTINEL_PROXY: ${SENTINEL_PROXY:-}
+    volumes:
+      - ./data:/data
+      - ./sample_challenge.json:/app/sample_challenge.json:ro
+    # 默认跑离线 dry-run，验证装好了
+    command: ["register", "-n", "1"]

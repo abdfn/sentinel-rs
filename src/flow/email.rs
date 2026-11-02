@@ -1,18 +1,24 @@
 //! 通用邮箱取码 API 客户端（纯 HTTP 契约，不绑定任何具体服务 / 私有凭据）。
 //!
 //! ### 环境变量
-//! * `REG_MAIL_API_BASE_URL`（必填）—— 邮箱服务基地址，必须 `https://`。
+//! * `REG_MAIL_ENTRY`（可选）—— **固定邮箱**：`email----code_url`（4 个连字符分隔）。
+//!   设置后跳过 `POST /mailboxes`，直接用这个邮箱注册、直接从这个地址取码。
+//!   与 `REG_MAIL_API_BASE_URL` 同时设置时**以本项为准**。
+//! * `REG_MAIL_API_BASE_URL`（领邮箱模式必填）—— 邮箱服务基地址，必须 `https://`。
 //!   本地自建 / mock 服务可用 `http://127.0.0.1:PORT/...`，但必须同时显式设置
 //!   `REG_MAIL_ALLOW_INSECURE=1`（回环地址才放行，别的 `http://` 一律拒绝）。
 //! * `REG_MAIL_API_TOKEN`（可选）—— 非空时作为 `Authorization: Bearer <token>` 发送。
 //!
 //! ### 契约
 //! * `POST {base}/mailboxes` → `201 {"email": "...", "code_url": "https://..."}`
-//! * `GET  {code_url}`       → 取码页 HTML（最新在前，`<article>` 卡片里
-//!   `<div class="meta">时间：…</div>` + `<div class="code">123456</div>`）
+//! * `GET  {code_url}`       → 取码页。两种形态都认：
+//!   - HTML（最新在前，`<article>` 卡片里 `<div class="meta">时间：…</div>` +
+//!     `<div class="code">123456</div>`）
+//!   - JSON（任意嵌套，邮件对象里带 6 位验证码 + 可选时间字段，字段名见
+//!     [`super::otp::parse_cards_json`]）
 //! * `GET  {base}/health`    → 可选自检 `{"ok": true}`，只在 dry-run 请求计划里出现
 //!
-//! 取码逻辑复用 [`super::otp`]，本文件只做 "取 HTML"。
+//! 取码逻辑复用 [`super::otp`]，本文件只做 "取正文"。
 
 use super::http::{Client, RequestSpec};
 use super::otp;
@@ -26,6 +32,10 @@ use tracing::{info, warn};
 pub const ENV_BASE_URL: &str = "REG_MAIL_API_BASE_URL";
 pub const ENV_TOKEN: &str = "REG_MAIL_API_TOKEN";
 pub const ENV_ALLOW_INSECURE: &str = "REG_MAIL_ALLOW_INSECURE";
+/// `email----code_url`：固定邮箱，跳过领邮箱 API。
+pub const ENV_ENTRY: &str = "REG_MAIL_ENTRY";
+/// 固定邮箱列表文件（每行一条 `email----code_url`，`#` 开头忽略）。
+pub const ENV_ENTRY_FILE: &str = "REG_MAIL_ENTRY_FILE";
 
 /// 邮箱 API 基地址 + 可选 bearer token。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +145,75 @@ pub fn is_loopback_url(url: &str) -> bool {
     host == "localhost" || host == "::1" || host == "127.0.0.1" || host.starts_with("127.")
 }
 
+/// 固定邮箱：调用方直接给一个已存在的收件地址和它的取码地址，跳过领邮箱 API。
+///
+/// 环境变量 `REG_MAIL_ENTRY`，格式 `email----code_url`（分隔符是 **4 个连字符**，
+/// 邮箱里的 `+` / `-` 不受影响；取码地址里的查询串原样保留）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedMailbox {
+    pub email: String,
+    pub code_url: String,
+}
+
+impl FixedMailbox {
+    /// 解析 `email----code_url` 并校验两端。
+    pub fn parse(raw: &str, allow_insecure: bool) -> Result<Self> {
+        // Windows 下用 PowerShell 写文件常带 UTF-8 BOM，先剥掉再解析。
+        let raw = raw.trim().trim_start_matches('\u{feff}');
+        let (email, code_url) = raw.split_once("----").with_context(|| {
+            format!("邮箱条目格式应为 email----code_url（4 个连字符分隔），当前 {raw:?}")
+        })?;
+        let email = email.trim().to_string();
+        let code_url = code_url.trim().to_string();
+        if !email.contains('@') {
+            bail!("邮箱条目里的邮箱非法: {email:?}");
+        }
+        check_fetchable_url("code_url", &code_url, allow_insecure)?;
+        Ok(Self { email, code_url })
+    }
+}
+
+/// 读取固定邮箱列表：`REG_MAIL_ENTRY`（单条，或多行 / 分号分隔）+
+/// `REG_MAIL_ENTRY_FILE`（文件每行一条）。两个都设就按顺序拼起来。
+pub fn entries_from_lookup<F>(lookup: &F) -> Result<Vec<FixedMailbox>>
+where
+    F: Fn(&str) -> Option<String> + ?Sized,
+{
+    let allow_insecure = is_truthy(lookup(ENV_ALLOW_INSECURE).as_deref());
+    let mut out = Vec::new();
+    if let Some(raw) = lookup(ENV_ENTRY) {
+        for line in split_entry_lines(&raw) {
+            out.push(FixedMailbox::parse(line, allow_insecure)?);
+        }
+    }
+    if let Some(path) = lookup(ENV_ENTRY_FILE)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("读取 {ENV_ENTRY_FILE} 失败: {path}"))?;
+        for line in split_entry_lines(&text) {
+            out.push(FixedMailbox::parse(line, allow_insecure)?);
+        }
+    }
+    Ok(out)
+}
+
+/// 一行一条：忽略空行和 `#` 注释，允许 `\n` / `\r\n` / `;` 分隔。
+fn split_entry_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split(['\n', '\r', ';'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// 展示用地址：去掉查询串（`api_key` 之类），只留 `scheme://host/path`。
+pub fn redact_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((head, _)) => format!("{head}?<redacted>"),
+        None => url.to_string(),
+    }
+}
+
 // ─────────────────────────── 响应模型 ───────────────────────────
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -183,7 +262,7 @@ fn check_fetchable_url(field: &str, url: &str, allow_insecure: bool) -> Result<(
     if url.starts_with("http://") && allow_insecure && is_loopback_url(url) {
         return Ok(());
     }
-    bail!("邮箱 API 返回的 {field} 不是 https（且未放行回环 http）: {url:?}")
+    bail!("取码地址不是 https（且未放行回环 http）: {field} = {url:?}")
 }
 
 /// 解析 `POST /mailboxes` 的响应（201）。
@@ -274,17 +353,7 @@ impl<'a> MailApiClient<'a> {
     }
 
     pub fn inbox_spec(&self, code_url: &str) -> RequestSpec {
-        RequestSpec::get("email.inbox", code_url.to_string()).with_headers(vec![
-            (
-                "accept".to_string(),
-                "text/html,application/xhtml+xml".to_string(),
-            ),
-            (
-                "cache-control".to_string(),
-                "no-cache, no-store, max-age=0".to_string(),
-            ),
-            ("pragma".to_string(), "no-cache".to_string()),
-        ])
+        inbox_spec(code_url)
     }
 
     pub async fn health(&self) -> Result<JsonValue> {
@@ -307,15 +376,7 @@ impl<'a> MailApiClient<'a> {
     }
 
     pub async fn fetch_inbox(&self, code_url: &str) -> Result<String> {
-        let resp = self.http()?.execute(&self.inbox_spec(code_url)).await?;
-        if !resp.is_success() {
-            bail!(
-                "取码页返回 HTTP {}: {}",
-                resp.status,
-                resp.body.chars().take(200).collect::<String>()
-            );
-        }
-        Ok(resp.body)
+        fetch_inbox(self.http()?, code_url).await
     }
 
     /// 轮询取码：`max_wait_secs` 内每 `interval_secs` 拉一次取码页。
@@ -325,52 +386,95 @@ impl<'a> MailApiClient<'a> {
         max_wait_secs: u64,
         interval_secs: u64,
     ) -> Result<String> {
-        let started = now_ts();
-        let deadline = Instant::now() + Duration::from_secs(max_wait_secs);
-        let interval = Duration::from_secs(interval_secs.max(1));
-        let mut baseline: Option<HashSet<String>> = None;
-        let mut last_error = String::from("尚未出现本次请求之后的新验证码");
-
-        info!(
-            "[email] 开始轮询验证码：最长 {}s，间隔 {}s",
-            max_wait_secs,
-            interval.as_secs()
-        );
-        while Instant::now() < deadline {
-            match self.fetch_inbox(code_url).await {
-                Ok(html) => {
-                    if baseline.is_none() {
-                        baseline = Some(
-                            otp::parse_cards(&html)
-                                .into_iter()
-                                .filter(|card| otp::card_timestamp(card).is_none())
-                                .filter_map(|card| card.otp())
-                                .collect(),
-                        );
-                    }
-                    let empty = HashSet::new();
-                    if let Some(code) = otp::select_fresh_otp(
-                        &html,
-                        Some(started),
-                        baseline.as_ref().unwrap_or(&empty),
-                    ) {
-                        info!("[email] 已取得验证码");
-                        return Ok(code);
-                    }
-                }
-                Err(err) => {
-                    last_error = format!("{err:#}");
-                    warn!("[email] 取码页请求失败: {last_error}");
-                }
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            tokio::time::sleep(interval.min(remaining)).await;
-        }
-        bail!("等待邮箱验证码超时: {last_error}")
+        poll_otp(self.http()?, code_url, max_wait_secs, interval_secs).await
     }
+}
+
+// ─────────────────────────── 取码（与领取方式无关）───────────────────────────
+
+/// 取码页请求：HTML 卡片和 JSON 接口都可能，所以两种 `accept` 都带上。
+pub fn inbox_spec(code_url: &str) -> RequestSpec {
+    RequestSpec::get("email.inbox", code_url.to_string()).with_headers(vec![
+        (
+            "accept".to_string(),
+            "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8".to_string(),
+        ),
+        (
+            "cache-control".to_string(),
+            "no-cache, no-store, max-age=0".to_string(),
+        ),
+        ("pragma".to_string(), "no-cache".to_string()),
+    ])
+}
+
+/// 拉一次取码页正文（HTML 或 JSON，交给 [`super::otp::parse_cards_any`] 判定）。
+pub async fn fetch_inbox(http: &Client, code_url: &str) -> Result<String> {
+    let resp = http.execute(&inbox_spec(code_url)).await?;
+    if !resp.is_success() {
+        bail!(
+            "取码页返回 HTTP {}: {}",
+            resp.status,
+            resp.body.chars().take(200).collect::<String>()
+        );
+    }
+    Ok(resp.body)
+}
+
+/// 轮询取码：`max_wait_secs` 内每 `interval_secs` 拉一次取码页。
+///
+/// 支持两种响应：HTML 卡片页、JSON 邮件接口（都规约成 [`otp::InboxCard`]）。
+pub async fn poll_otp(
+    http: &Client,
+    code_url: &str,
+    max_wait_secs: u64,
+    interval_secs: u64,
+) -> Result<String> {
+    let started = now_ts();
+    let deadline = Instant::now() + Duration::from_secs(max_wait_secs);
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let mut baseline: Option<HashSet<String>> = None;
+    let mut last_error = String::from("尚未出现本次请求之后的新验证码");
+
+    info!(
+        "[email] 开始轮询验证码：最长 {}s，间隔 {}s",
+        max_wait_secs,
+        interval.as_secs()
+    );
+    while Instant::now() < deadline {
+        match fetch_inbox(http, code_url).await {
+            Ok(body) => {
+                let cards = otp::parse_cards_any(&body);
+                if baseline.is_none() {
+                    baseline = Some(
+                        cards
+                            .iter()
+                            .filter(|card| otp::card_timestamp(card).is_none())
+                            .filter_map(|card| card.otp())
+                            .collect(),
+                    );
+                }
+                let empty = HashSet::new();
+                if let Some(code) = otp::select_fresh_otp_from_cards(
+                    &cards,
+                    Some(started),
+                    baseline.as_ref().unwrap_or(&empty),
+                ) {
+                    info!("[email] 已取得验证码");
+                    return Ok(code);
+                }
+            }
+            Err(err) => {
+                last_error = format!("{err:#}");
+                warn!("[email] 取码页请求失败: {last_error}");
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+    }
+    bail!("等待邮箱验证码超时: {last_error}")
 }
 
 fn now_ts() -> i64 {

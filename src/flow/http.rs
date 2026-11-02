@@ -306,6 +306,30 @@ pub fn body_string(resp: &HttpResponse) -> &str {
     &resp.body
 }
 
+/// 请求字节粗算（URL + 头 + body，不含 TLS 记录头）。
+fn approx_request_bytes(spec: &RequestSpec) -> u64 {
+    let mut total = spec.url.len() + 32;
+    for (name, value) in &spec.headers {
+        total += name.len() + value.len() + 4;
+    }
+    if let Some(body) = &spec.body {
+        total += body.to_string().len();
+    }
+    if let Some(raw) = &spec.raw_body {
+        total += raw.text.len();
+    }
+    total as u64
+}
+
+/// 响应字节粗算（状态行 + 头 + 正文）。
+fn approx_response_bytes(resp: &HttpResponse) -> u64 {
+    let mut total = resp.body.len() + 32;
+    for (name, value) in &resp.headers {
+        total += name.len() + value.len() + 4;
+    }
+    total as u64
+}
+
 fn truncate(text: &str, limit: usize) -> String {
     let head: String = text.chars().take(limit).collect();
     if text.chars().count() > limit {
@@ -320,7 +344,7 @@ fn truncate(text: &str, limit: usize) -> String {
 /// 用 `wreq::Uri`（http crate 的 Uri）做校验：它认任意 scheme
 /// （`http` / `https` / `socks5` / `socks5h` …）和 `user:pass@` 形式的 userinfo。
 pub fn normalize_proxy_url(raw: &str) -> Result<String> {
-    let raw = raw.trim();
+    let raw = raw.trim().trim_start_matches('\u{feff}');
     if raw.is_empty() {
         bail!("代理地址为空");
     }
@@ -337,6 +361,33 @@ pub fn normalize_proxy_url(raw: &str) -> Result<String> {
         bail!("代理地址缺少 host/port: {with_scheme}");
     }
     Ok(with_scheme)
+}
+
+/// 代理池行 → 代理 URL。支持三种写法：
+///
+/// * `host:port`
+/// * `host:port:user:pass`（代理池导出最常见的格式）
+/// * `scheme://[user:pass@]host:port`
+pub fn normalize_proxy_line(raw: &str) -> Result<String> {
+    let raw = raw.trim().trim_start_matches('\u{feff}');
+    if raw.is_empty() {
+        bail!("代理地址为空");
+    }
+    if raw.contains("://") {
+        return normalize_proxy_url(raw);
+    }
+    let parts: Vec<&str> = raw.split(':').collect();
+    match parts.len() {
+        2 => normalize_proxy_url(raw),
+        4 => {
+            let (host, port, user, pass) = (parts[0], parts[1], parts[2], parts[3]);
+            if host.is_empty() || port.is_empty() {
+                bail!("代理池行缺少 host/port: {raw}");
+            }
+            normalize_proxy_url(&format!("http://{user}:{pass}@{host}:{port}"))
+        }
+        _ => bail!("代理池行格式不支持（期望 host:port 或 host:port:user:pass）: {raw}"),
+    }
 }
 
 /// 把 `TURB_WREQ_EMULATION` 的字符串映射成 [`Profile`]。
@@ -389,6 +440,9 @@ pub struct Client {
     pub user_agent: String,
     /// 实际生效的 TLS/HTTP2 emulation（`TURB_WREQ_EMULATION` 可覆盖）。
     pub emulation: Profile,
+    /// 本次会话累计上行 / 下行字节（HTTP 层，不含 TLS 记录头）。
+    sent_bytes: Arc<std::sync::atomic::AtomicU64>,
+    recv_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Client {
@@ -449,7 +503,17 @@ impl Client {
             proxy: proxy.map(str::to_string),
             user_agent: user_agent.to_string(),
             emulation,
+            sent_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            recv_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// 本次会话累计 `(上行字节, 下行字节)`。
+    pub fn traffic(&self) -> (u64, u64) {
+        (
+            self.sent_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            self.recv_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// 当前 jar 里对 `url` 的 Cookie 头（落库/调试用）。
@@ -477,6 +541,17 @@ impl Client {
         loop {
             attempt += 1;
             let result = self.send_once(spec).await;
+
+            // 流量统计：请求体 + URL + 头（粗算），响应按正文 + 头。
+            let req_bytes = approx_request_bytes(spec);
+            self.sent_bytes
+                .fetch_add(req_bytes, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(resp) = &result {
+                self.recv_bytes.fetch_add(
+                    approx_response_bytes(resp),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
 
             let (retryable, status) = match &result {
                 Ok(resp) => (

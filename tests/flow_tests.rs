@@ -201,7 +201,7 @@ fn config_defaults_are_dry_run() {
     assert!(cfg.dry_run, "默认必须 dry-run");
     assert!(cfg.email_api.is_none());
     assert!(cfg.proxy.is_none());
-    assert!(!cfg.enable_2fa);
+    assert!(cfg.enable_2fa, "2FA 默认开启");
     assert_eq!(cfg.db_path.to_string_lossy(), "data/sentinel-rs.db");
     assert_eq!(cfg.otp_max_wait_secs, 180);
     assert_eq!(cfg.otp_poll_interval_secs, 3);
@@ -375,6 +375,138 @@ fn email_parses_mailbox_and_error_responses() {
 
     assert!(email::parse_health_response(200, r#"{"ok":true}"#).is_ok());
     assert!(email::parse_health_response(200, r#"{"ok":false}"#).is_err());
+}
+
+#[test]
+fn fixed_mailbox_parses_email_dash_dash_code_url() {
+    let raw = "user+tag@example.invalid----\
+               https://mail.example.invalid/mailsystem/api/v1/mail/recent?api_key=icm_abc";
+    let fixed = email::FixedMailbox::parse(raw, false).unwrap();
+    assert_eq!(fixed.email, "user+tag@example.invalid");
+    assert_eq!(
+        fixed.code_url,
+        "https://mail.example.invalid/mailsystem/api/v1/mail/recent?api_key=icm_abc"
+    );
+
+    // 分隔符是 4 个连字符：邮箱本身带 `-` / `+` 不会被切坏
+    let dashed = email::FixedMailbox::parse("a-b+c@x.invalid----https://m.invalid/c/1", false).unwrap();
+    assert_eq!(dashed.email, "a-b+c@x.invalid");
+    assert_eq!(dashed.code_url, "https://m.invalid/c/1");
+
+    // 缺分隔符 / 邮箱无 @ / 取码地址不是 https → 报错并点名字段
+    assert!(email::FixedMailbox::parse("no-separator", false).is_err());
+    assert!(email::FixedMailbox::parse("bad-email----https://m.invalid/c", false).is_err());
+    let err = email::FixedMailbox::parse("a@b.invalid----http://m.invalid/c", false).unwrap_err();
+    assert!(format!("{err:#}").contains("https"), "{err:#}");
+
+    // 回环 http + 逃生门 → 放行（本地 mock）
+    assert!(email::FixedMailbox::parse("a@b.invalid----http://127.0.0.1:8899/c", true).is_ok());
+
+    // 展示用地址要抹掉查询串
+    assert_eq!(
+        email::redact_url("https://m.invalid/c/1?api_key=secret"),
+        "https://m.invalid/c/1?<redacted>"
+    );
+}
+
+#[test]
+fn config_accepts_fixed_mailbox_entry() {
+    let cfg = RegisterConfig::from_lookup(lookup_from(&[
+        ("REG_MAIL_ENTRY", "a@b.invalid----https://m.invalid/c/1"),
+        ("SENTINEL_LIVE_REGISTER", "1"),
+    ]))
+    .unwrap();
+    assert!(cfg.email_api.is_none());
+    let fixed = cfg.mail_entries.first().expect("固定邮箱应已解析");
+    assert_eq!(fixed.email, "a@b.invalid");
+    cfg.require_live_prerequisites().unwrap(); // 固定邮箱满足 live 前提
+
+    // 邮箱数量不够就别开跑
+    let mut multi = cfg.clone();
+    multi.count = 2; // 等价于命令行 `-n 2`（解析完配置后才覆盖）
+    let err = multi.require_live_prerequisites().unwrap_err();
+    assert!(format!("{err:#}").contains("超出"), "{err:#}");
+}
+
+#[test]
+fn config_parses_mailbox_list_and_proxy_pool() {
+    let cfg = RegisterConfig::from_lookup(lookup_from(&[
+        (
+            "REG_MAIL_ENTRY",
+            "a@b.invalid----https://m.invalid/c/1;\n\
+             # 注释行忽略\n\
+             c@d.invalid----https://m.invalid/c/2",
+        ),
+        (
+            "SENTINEL_PROXY_POOL",
+            "us.proxy.invalid:6666:user-1:pass-1\nus.proxy.invalid:6667:user-2:pass-2",
+        ),
+        ("SENTINEL_COUNT", "2"),
+    ]))
+    .unwrap();
+
+    assert_eq!(cfg.mail_entries.len(), 2, "邮箱列表应解析出 2 条");
+    assert_eq!(cfg.mail_entries[1].email, "c@d.invalid");
+    assert_eq!(
+        cfg.proxy_pool,
+        vec![
+            "http://user-1:pass-1@us.proxy.invalid:6666".to_string(),
+            "http://user-2:pass-2@us.proxy.invalid:6667".to_string(),
+        ]
+    );
+    assert_eq!(cfg.mailbox_for(1).unwrap().email, "c@d.invalid");
+    assert_eq!(cfg.mailbox_for(2).unwrap().email, "a@b.invalid", "超出按取模轮转");
+    assert_eq!(
+        cfg.proxy_for(1).as_deref(),
+        Some("http://user-2:pass-2@us.proxy.invalid:6667")
+    );
+    cfg.require_live_prerequisites().unwrap();
+}
+
+#[test]
+fn otp_extracts_from_json_mail_api() {
+    let body = r#"{"code":0,"data":[{"id":"9","subject":"Your OpenAI verification code",
+        "content":"Enter this code: 778324","created_at":"2026-11-02 10:00:00"}]}"#;
+    let cards = otp::parse_cards_any(body);
+    assert_eq!(cards.len(), 1, "应解析出一张卡片: {cards:?}");
+    assert_eq!(cards[0].otp(), Some("778324".to_string()));
+
+    // 时间过滤：发码之后才出现的新码才算新鲜
+    let after = otp::parse_meta_timestamp("2026-11-02 10:30:00").unwrap();
+    assert_eq!(
+        otp::select_fresh_otp_from_cards(&cards, Some(after), &HashSet::new()),
+        None
+    );
+    let before = otp::parse_meta_timestamp("2026-11-02 09:59:00").unwrap();
+    assert_eq!(
+        otp::select_fresh_otp_from_cards(&cards, Some(before), &HashSet::new()),
+        Some("778324".to_string())
+    );
+
+    // unix 秒 / 毫秒时间戳都认
+    let ms = otp::parse_cards_any(r#"{"data":[{"content":"code 123456","timestamp":1762000000000}]}"#);
+    assert_eq!(otp::card_timestamp(&ms[0]), Some(1_762_000_000));
+
+    // HTML 与 JSON 走同一个入口
+    assert_eq!(otp::parse_cards_any("<article><div class=\"code\">111111</div></article>").len(), 1);
+}
+
+#[test]
+fn dry_run_plan_uses_fixed_mailbox_without_create_step() {
+    let cfg = RegisterConfig::from_lookup(lookup_from(&[(
+        "REG_MAIL_ENTRY",
+        "a@b.invalid----https://m.invalid/c/1?api_key=secret",
+    )]))
+    .unwrap();
+    let identity = RegisterIdentity::placeholder();
+    let plan: Vec<String> = flow::build_plan_steps(&cfg, &identity)
+        .iter()
+        .map(|step| step.describe())
+        .collect();
+    let text = plan.join("\n");
+    assert!(text.contains("固定邮箱 a@b.invalid"), "{text}");
+    assert!(!text.contains("email.create_mailbox"), "固定邮箱不该有领邮箱步骤: {text}");
+    assert!(!text.contains("api_key=secret"), "计划里不能回显 api_key: {text}");
 }
 
 // ─────────────────────────── 请求构造 / 响应解析 ───────────────────────────
@@ -607,7 +739,10 @@ fn twofa_parses_enroll_and_mfa_info() {
 
 #[test]
 fn dry_run_plan_is_offline_and_complete() {
-    let cfg = RegisterConfig::default();
+    let cfg = RegisterConfig {
+        enable_2fa: false,
+        ..RegisterConfig::default()
+    };
     assert!(cfg.dry_run);
     let identity = RegisterIdentity::placeholder();
     let plan = flow::build_plan(&cfg, &identity);

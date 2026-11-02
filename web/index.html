@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sentinel-rs 控制台</title>
+<style>
+  :root{
+    --bg:#0b1020; --panel:#121a2e; --panel-2:#0f1626; --line:#22304d;
+    --text:#e8eefc; --muted:#8ea2c6; --accent:#4fd1c5; --accent-2:#7c9cff;
+    --ok:#3ddc97; --warn:#ffc857; --bad:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#16224a 0%,var(--bg) 55%);
+       color:var(--text);font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;min-height:100vh}
+  header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:22px 28px;border-bottom:1px solid var(--line);
+         background:linear-gradient(180deg,rgba(18,26,46,.9),rgba(11,16,32,.6));position:sticky;top:0;z-index:5;backdrop-filter:blur(8px)}
+  header h1{margin:0;font-size:18px;letter-spacing:.5px}
+  header h1 span{color:var(--accent)}
+  .spacer{flex:1}
+  .meta{color:var(--muted);font-size:12px}
+  button{background:#1a2540;color:var(--text);border:1px solid var(--line);padding:8px 14px;border-radius:10px;
+         cursor:pointer;font:inherit;transition:.15s}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button:disabled{opacity:.45;cursor:default}
+  button.ghost{background:transparent}
+  button.danger:hover{border-color:var(--bad);color:var(--bad)}
+  main{padding:22px 28px 48px;max-width:1500px;margin:0 auto}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:22px}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:16px;padding:16px 18px}
+  .card .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+  .card .v{font-size:26px;font-weight:700;margin-top:6px}
+  .card .v small{font-size:13px;color:var(--muted);font-weight:400}
+  .grid{display:grid;gap:18px}
+  section{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:16px;overflow:hidden}
+  section > .head{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  section h2{margin:0;font-size:15px}
+  .badge{font-size:12px;color:var(--muted)}
+  input[type=search],textarea{background:#0d1526;border:1px solid var(--line);color:var(--text);padding:8px 12px;border-radius:10px;font:inherit}
+  input[type=search]{margin-left:auto;min-width:220px}
+  input[type=search]:focus,textarea:focus{outline:none;border-color:var(--accent-2)}
+  textarea{width:100%;min-height:74px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .table-wrap{max-height:460px;overflow:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead th{position:sticky;top:0;background:#101a30;color:var(--muted);text-align:left;font-weight:600;
+           padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:1}
+  tbody td{padding:9px 14px;border-bottom:1px solid rgba(34,48,77,.6);white-space:nowrap}
+  tbody tr:hover{background:rgba(79,209,197,.05)}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-size:12px;border:1px solid transparent}
+  .pill.ok{color:var(--ok);background:rgba(61,220,151,.1);border-color:rgba(61,220,151,.3)}
+  .pill.warn{color:var(--warn);background:rgba(255,200,87,.1);border-color:rgba(255,200,87,.3)}
+  .pill.bad{color:var(--bad);background:rgba(255,107,107,.1);border-color:rgba(255,107,107,.3)}
+  .pill.info{color:var(--accent-2);background:rgba(124,156,255,.1);border-color:rgba(124,156,255,.3)}
+  .mono{font-family:ui-monospace,Consolas,"Cascadia Code",monospace;font-size:12px}
+  .muted{color:var(--muted)}
+  .foot{margin-top:18px;color:var(--muted);font-size:12px;display:flex;gap:18px;flex-wrap:wrap}
+  .err{color:var(--bad);padding:8px 0}
+  .toolbar{display:flex;gap:10px;align-items:flex-start;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .toolbar .col{flex:1;display:flex;flex-direction:column;gap:8px}
+  .toolbar .row{display:flex;gap:10px;flex-wrap:wrap}
+  .switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--muted)}
+  .switch input{display:none}
+  .switch .track{width:34px;height:18px;border-radius:999px;background:#26314c;position:relative;transition:.15s}
+  .switch .track::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#7b8ba8;transition:.15s}
+  .switch input:checked + .track{background:rgba(61,220,151,.3)}
+  .switch input:checked + .track::after{left:18px;background:var(--ok)}
+  .toast{position:fixed;right:22px;bottom:22px;background:#152139;border:1px solid var(--line);color:var(--text);
+         padding:12px 16px;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.4);opacity:0;transform:translateY(8px);
+         transition:.2s;pointer-events:none;max-width:420px;font-size:13px}
+  .toast.show{opacity:1;transform:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>sentinel<span>-rs</span> 控制台</h1>
+  <span class="meta" id="updated">加载中…</span>
+  <div class="spacer"></div>
+  <button id="refresh-all">刷新套餐</button>
+  <button id="refresh" class="ghost">刷新页面</button>
+  <button id="auto" class="ghost">自动刷新：开</button>
+</header>
+
+<main>
+  <div class="stats" id="stats"></div>
+
+  <div class="grid">
+    <section>
+      <div class="head">
+        <h2>账号池</h2><span class="badge" id="accounts-badge">0</span>
+        <input type="search" id="accounts-q" placeholder="搜索邮箱 / 套餐…" />
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>#</th><th>邮箱</th><th>状态</th><th>套餐</th><th>优惠</th>
+            <th>access_token</th><th>TOTP</th><th>操作</th>
+          </tr></thead>
+          <tbody id="accounts-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>邮箱池</h2><span class="badge" id="mail-badge">0</span>
+        <input type="search" id="mail-q" placeholder="搜索邮箱…" />
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>邮箱</th><th>取码接口</th><th>已注册</th><th>2FA</th></tr></thead>
+          <tbody id="mail-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>代理池</h2><span class="badge" id="proxy-badge">0</span>
+        <input type="search" id="proxy-q" placeholder="搜索 host / session…" />
+      </div>
+      <div class="toolbar">
+        <div class="col">
+          <textarea id="proxy-input" placeholder="每行一条：host:port:user:pass（也支持 host:port / scheme://user:pass@host:port）"></textarea>
+          <div class="row">
+            <button id="proxy-add">添加代理</button>
+            <button id="proxy-import" class="ghost">从 proxy.txt 导入</button>
+            <span class="muted" style="font-size:12px;align-self:center">注册时自动使用「已启用」的代理，按顺序分配</span>
+          </div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>Host</th><th>端口</th><th>Session</th><th>账号</th><th>启用</th><th>操作</th></tr></thead>
+          <tbody id="proxy-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="foot" id="paths"></div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let timer = null, auto = true;
+let snapshot = { accounts: [], mail: [], proxies: [], stats: {} };
+
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+}[c]));
+
+const fmtTime = (ts) => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
+
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+const statusPill = (s) => `<span class="pill ${s === "registered" ? "ok" : "warn"}">${esc(s || "unknown")}</span>`;
+
+function planCell(a) {
+  if (!a.plan_display && !a.plan_type) return '<span class="muted">—</span>';
+  const t = (a.plan_type || "").toLowerCase();
+  const cls = t.includes("pro") ? "info" : t.includes("plus") ? "ok" : "warn";
+  return `<span class="pill ${cls}">${esc(a.plan_display || a.plan_type)}</span>`;
+}
+
+function trialCell(a) {
+  if (a.is_trial) return '<span class="pill ok">试用中</span>';
+  if (a.has_discount) {
+    const tip = a.discount_summary ? esc(a.discount_summary) : "接口返回了折扣字段";
+    return `<span class="pill ok" title="${tip}">有优惠</span>`;
+  }
+  return '<span class="muted" title="接口 discount / applied_discounts / promo 均为空">无</span>';
+}
+
+function renderStats() {
+  const s = snapshot.stats || {};
+  const cards = [
+    ["账号总数", s.accounts ?? 0, ""],
+    ["已注册", s.registered ?? 0, `<small>/ ${s.accounts ?? 0}</small>`],
+    ["已绑 2FA", s.with_totp ?? 0, `<small>/ ${s.accounts ?? 0}</small>`],
+    ["套餐已同步", s.with_plan ?? 0, `<small>/ ${s.accounts ?? 0}</small>`],
+    ["有真优惠", s.with_discount ?? 0, `<small>/ ${s.accounts ?? 0}</small>`],
+    ["邮箱池", s.mail_total ?? 0, `<small>已用 ${s.mail_used ?? 0}</small>`],
+    ["代理池", s.proxy_total ?? 0, `<small>启用 ${s.proxy_enabled ?? 0}</small>`],
+  ];
+  $("stats").innerHTML = cards.map(([k, v, extra]) =>
+    `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)} ${extra}</div></div>`).join("");
+}
+
+function renderAccounts() {
+  const q = $("accounts-q").value.trim().toLowerCase();
+  const rows = snapshot.accounts.filter((a) =>
+    !q || a.email.toLowerCase().includes(q) || (a.plan_display || "").toLowerCase().includes(q));
+  $("accounts-badge").textContent = `${rows.length} / ${snapshot.accounts.length}`;
+  $("accounts-body").innerHTML = rows.map((a) => `
+    <tr>
+      <td class="muted">${a.id}</td>
+      <td class="mono">${esc(a.email)}</td>
+      <td>${statusPill(a.status)}</td>
+      <td>${planCell(a)}</td>
+      <td>${trialCell(a)}</td>
+      <td class="mono">${a.has_token ? esc(a.token_masked) : '<span class="muted">-</span>'}</td>
+      <td>${a.has_totp ? `<span class="pill ok">已绑</span>` : '<span class="pill bad">未绑</span>'}</td>
+      <td><button class="ghost" data-refresh="${a.id}">刷新套餐</button></td>
+    </tr>`).join("") || `<tr><td colspan="8" class="muted" style="padding:16px">没有数据</td></tr>`;
+}
+
+function renderMail() {
+  const q = $("mail-q").value.trim().toLowerCase();
+  const rows = snapshot.mail.filter((m) => !q || m.email.toLowerCase().includes(q));
+  $("mail-badge").textContent = `${rows.length} / ${snapshot.mail.length}`;
+  $("mail-body").innerHTML = rows.map((m, i) => `
+    <tr>
+      <td class="muted">${i + 1}</td>
+      <td class="mono">${esc(m.email)}</td>
+      <td class="mono muted">${esc(m.code_url)}</td>
+      <td>${m.registered ? `<span class="pill ok">#${m.account_id}</span>` : '<span class="pill warn">待用</span>'}</td>
+      <td>${m.has_totp ? '<span class="pill ok">已绑</span>' : '<span class="muted">-</span>'}</td>
+    </tr>`).join("") || `<tr><td colspan="5" class="muted" style="padding:16px">没有数据</td></tr>`;
+}
+
+function renderProxies() {
+  const q = $("proxy-q").value.trim().toLowerCase();
+  const rows = snapshot.proxies.filter((p) =>
+    !q || (p.host || "").toLowerCase().includes(q) || (p.session || "").toLowerCase().includes(q));
+  $("proxy-badge").textContent = `${rows.length} / ${snapshot.proxies.length}`;
+  $("proxy-body").innerHTML = rows.map((p) => `
+    <tr>
+      <td class="muted">${p.id}</td>
+      <td class="mono">${esc(p.host || "-")}</td>
+      <td class="muted">${esc(p.port || "-")}</td>
+      <td class="mono">${esc(p.session || "-")}</td>
+      <td class="mono muted">${esc(p.user_label || "-")}</td>
+      <td>
+        <label class="switch">
+          <input type="checkbox" data-toggle="${p.id}" ${p.enabled ? "checked" : ""}>
+          <span class="track"></span>
+        </label>
+      </td>
+      <td><button class="ghost danger" data-del="${p.id}">删除</button></td>
+    </tr>`).join("") || `<tr><td colspan="7" class="muted" style="padding:16px">没有数据</td></tr>`;
+}
+
+function renderAll() { renderStats(); renderAccounts(); renderMail(); renderProxies(); }
+
+async function load() {
+  try {
+    const resp = await fetch("/api/summary", { cache: "no-store" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    snapshot = data;
+    renderAll();
+    $("updated").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    $("paths").innerHTML = [["DB", data.paths?.db], ["邮箱池", data.paths?.mail], ["代理池文件", data.paths?.proxy_file]]
+      .map(([k, v]) => `<span><b class="muted">${esc(k)}:</b> <span class="mono">${esc(v)}</span></span>`).join("");
+  } catch (err) {
+    $("updated").innerHTML = `<span class="err">加载失败：${esc(err.message)}</span>`;
+  }
+}
+
+async function post(path, body) {
+  const resp = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || resp.statusText);
+  return data;
+}
+
+function setAuto(on) {
+  auto = on;
+  $("auto").textContent = "自动刷新：" + (on ? "开" : "关");
+  if (timer) clearInterval(timer);
+  timer = on ? setInterval(load, 10000) : null;
+}
+
+// 事件
+$("refresh").addEventListener("click", load);
+$("auto").addEventListener("click", () => setAuto(!auto));
+
+["accounts-q", "mail-q", "proxy-q"].forEach((id) => $(id).addEventListener("input", renderAll));
+
+$("accounts-body").addEventListener("click", async (ev) => {
+  const id = ev.target.dataset.refresh;
+  if (!id) return;
+  ev.target.disabled = true;
+  try {
+    const data = await post("/api/accounts/refresh", { id: Number(id) });
+    const r = data.results?.[0];
+    toast(r?.ok ? `套餐已更新：${r.plan?.plan_display || "-"}` : `刷新失败：${r?.error || "未知"}`);
+    await load();
+  } catch (e) { toast("刷新失败：" + e.message); }
+  finally { ev.target.disabled = false; }
+});
+
+$("refresh-all").addEventListener("click", async (ev) => {
+  ev.target.disabled = true;
+  ev.target.textContent = "刷新中…";
+  try {
+    const data = await post("/api/accounts/refresh", {});
+    const ok = (data.results || []).filter((r) => r.ok).length;
+    toast(`套餐刷新完成：成功 ${ok} / ${(data.results || []).length}`);
+    await load();
+  } catch (e) { toast("刷新失败：" + e.message); }
+  finally { ev.target.disabled = false; ev.target.textContent = "刷新套餐"; }
+});
+
+$("proxy-add").addEventListener("click", async () => {
+  const lines = $("proxy-input").value.trim();
+  if (!lines) return toast("先贴点代理行");
+  try {
+    const data = await post("/api/proxies", { lines });
+    $("proxy-input").value = "";
+    toast(`已添加 ${data.added} 条（重复的自动跳过）`);
+    await load();
+  } catch (e) { toast("添加失败：" + e.message); }
+});
+
+$("proxy-import").addEventListener("click", async () => {
+  try {
+    const data = await post("/api/proxies/import", {});
+    toast(`已从 proxy.txt 导入 ${data.added} 条（重复的自动跳过）`);
+    await load();
+  } catch (e) { toast("导入失败：" + e.message); }
+});
+
+$("proxy-body").addEventListener("change", async (ev) => {
+  const id = ev.target.dataset.toggle;
+  if (!id) return;
+  try {
+    await post("/api/proxies/toggle", { id: Number(id), enabled: ev.target.checked });
+    toast(ev.target.checked ? "已启用" : "已停用");
+    await load();
+  } catch (e) { toast("操作失败：" + e.message); }
+});
+
+$("proxy-body").addEventListener("click", async (ev) => {
+  const id = ev.target.dataset.del;
+  if (!id) return;
+  if (!confirm(`删除代理 #${id}？`)) return;
+  try {
+    await post("/api/proxies/delete", { id: Number(id) });
+    toast("已删除");
+    await load();
+  } catch (e) { toast("删除失败：" + e.message); }
+});
+
+load();
+setAuto(true);
+</script>
+</body>
+</html>

@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 一条注册结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,6 +25,22 @@ pub struct Account {
     pub cookies: String,
     /// `pending` / `registered` / `failed` …
     pub status: String,
+    /// 套餐（`plan_type`：free / plus / pro …）。
+    pub plan_type: String,
+    /// 套餐展示名（`plan_display_name`：Free / Plus / Pro …）。
+    pub plan_display: String,
+    /// 服务端 `is_trial`。
+    pub is_trial: bool,
+    /// 服务端 `trial_state`（原样字符串，null 时为空串）。
+    pub trial_state: String,
+    /// `is_eligible_for_yearly_plus_new_user_subscription`：新用户优惠资格。
+    pub eligible_new_user: bool,
+    /// 是否真有折扣/促销（`discount` / `applied_discounts` / `eligible_promo_campaigns` 任一非空）。
+    pub has_discount: bool,
+    /// 折扣摘要（给前端直接展示）。
+    pub discount_summary: String,
+    /// 套餐信息最后刷新时间。
+    pub plan_updated_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -109,9 +125,33 @@ impl Store {
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS proxy_pool (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    line            TEXT NOT NULL UNIQUE,
+                    enabled         INTEGER NOT NULL DEFAULT 1,
+                    note            TEXT NOT NULL DEFAULT '',
+                    last_status     TEXT NOT NULL DEFAULT '',
+                    last_checked_at INTEGER NOT NULL DEFAULT 0,
+                    created_at      INTEGER NOT NULL DEFAULT 0
+                );
                 "#,
             )
             .context("初始化 schema 失败")?;
+
+        // 老库补列（幂等）
+        for (name, ddl) in [
+            ("plan_type", "TEXT NOT NULL DEFAULT ''"),
+            ("plan_display", "TEXT NOT NULL DEFAULT ''"),
+            ("is_trial", "INTEGER NOT NULL DEFAULT 0"),
+            ("trial_state", "TEXT NOT NULL DEFAULT ''"),
+            ("eligible_new_user", "INTEGER NOT NULL DEFAULT 0"),
+            ("has_discount", "INTEGER NOT NULL DEFAULT 0"),
+            ("discount_summary", "TEXT NOT NULL DEFAULT ''"),
+            ("plan_updated_at", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            self.ensure_column("accounts", name, ddl)?;
+        }
         self.conn
             .execute(
                 "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?1)
@@ -119,6 +159,26 @@ impl Store {
                 params![SCHEMA_VERSION.to_string()],
             )
             .context("写入 schema_version 失败")?;
+        Ok(())
+    }
+
+    /// 幂等补列：表里没有就 `ALTER TABLE ADD COLUMN`。
+    fn ensure_column(&self, table: &str, column: &str, ddl: &str) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .with_context(|| format!("读取 {table} 表结构失败"))?;
+        let exists = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("遍历表结构失败")?
+            .filter_map(std::result::Result::ok)
+            .any(|name| name.eq_ignore_ascii_case(column));
+        drop(stmt);
+        if !exists {
+            self.conn
+                .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"), [])
+                .with_context(|| format!("给 {table} 补列 {column} 失败"))?;
+        }
         Ok(())
     }
 
@@ -140,15 +200,25 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO accounts
-                    (email, password, access_token, totp_secret, cookies, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    (email, password, access_token, totp_secret, cookies, status,
+                     plan_type, plan_display, is_trial, trial_state, eligible_new_user,
+                     has_discount, discount_summary, plan_updated_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(email) DO UPDATE SET
-                    password     = excluded.password,
-                    access_token = excluded.access_token,
-                    totp_secret  = excluded.totp_secret,
-                    cookies      = excluded.cookies,
-                    status       = excluded.status,
-                    updated_at   = excluded.updated_at",
+                    password        = excluded.password,
+                    access_token    = excluded.access_token,
+                    totp_secret     = excluded.totp_secret,
+                    cookies         = excluded.cookies,
+                    status          = excluded.status,
+                    plan_type       = excluded.plan_type,
+                    plan_display    = excluded.plan_display,
+                    is_trial        = excluded.is_trial,
+                    trial_state     = excluded.trial_state,
+                    eligible_new_user = excluded.eligible_new_user,
+                    has_discount    = excluded.has_discount,
+                    discount_summary = excluded.discount_summary,
+                    plan_updated_at = excluded.plan_updated_at,
+                    updated_at      = excluded.updated_at",
                 params![
                     account.email,
                     account.password,
@@ -156,6 +226,14 @@ impl Store {
                     account.totp_secret,
                     account.cookies,
                     account.status,
+                    account.plan_type,
+                    account.plan_display,
+                    account.is_trial as i64,
+                    account.trial_state,
+                    account.eligible_new_user as i64,
+                    account.has_discount as i64,
+                    account.discount_summary,
+                    account.plan_updated_at,
                     created_at,
                     updated_at,
                 ],
@@ -173,7 +251,9 @@ impl Store {
     pub fn get_account(&self, email: &str) -> Result<Option<Account>> {
         self.conn
             .query_row(
-                "SELECT email, password, access_token, totp_secret, cookies, status, created_at, updated_at
+                "SELECT email, password, access_token, totp_secret, cookies, status,
+                        plan_type, plan_display, is_trial, trial_state, eligible_new_user,
+                        has_discount, discount_summary, plan_updated_at, created_at, updated_at
                  FROM accounts WHERE email = ?1",
                 params![email],
                 row_to_account,
@@ -186,7 +266,9 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT email, password, access_token, totp_secret, cookies, status, created_at, updated_at
+                "SELECT email, password, access_token, totp_secret, cookies, status,
+                        plan_type, plan_display, is_trial, trial_state, eligible_new_user,
+                        has_discount, discount_summary, plan_updated_at, created_at, updated_at
                  FROM accounts ORDER BY id DESC LIMIT ?1",
             )
             .context("准备查询语句失败")?;
@@ -198,6 +280,70 @@ impl Store {
             out.push(row.context("读取 accounts 行失败")?);
         }
         Ok(out)
+    }
+
+    // ── 代理池 ────────────────────────────────────────────────────────
+
+    /// 列出代理池（`enabled_only` 时只取启用的），按 id 升序。
+    pub fn list_proxies(&self, enabled_only: bool) -> Result<Vec<ProxyEntry>> {
+        let sql = if enabled_only {
+            "SELECT id, line, enabled, note, last_status, last_checked_at, created_at
+             FROM proxy_pool WHERE enabled = 1 ORDER BY id"
+        } else {
+            "SELECT id, line, enabled, note, last_status, last_checked_at, created_at
+             FROM proxy_pool ORDER BY id"
+        };
+        let mut stmt = self.conn.prepare(sql).context("准备代理池查询失败")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ProxyEntry {
+                    id: row.get(0)?,
+                    line: row.get(1)?,
+                    enabled: row.get::<_, i64>(2)? != 0,
+                    note: row.get(3)?,
+                    last_status: row.get(4)?,
+                    last_checked_at: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .context("查询代理池失败")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("读取代理池行失败")?);
+        }
+        Ok(out)
+    }
+
+    /// 新增代理；已存在（line 相同）返回 `Ok(false)`。
+    pub fn add_proxy(&self, line: &str, note: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO proxy_pool (line, enabled, note, created_at) VALUES (?1, 1, ?2, ?3)
+                 ON CONFLICT(line) DO NOTHING",
+                params![line.trim(), note.trim(), now_ts()],
+            )
+            .context("写入 proxy_pool 失败")?;
+        Ok(changed > 0)
+    }
+
+    pub fn set_proxy_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE proxy_pool SET enabled = ?1 WHERE id = ?2",
+                params![enabled as i64, id],
+            )
+            .context("更新 proxy_pool 失败")?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_proxy(&self, id: i64) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM proxy_pool WHERE id = ?1", params![id])
+            .context("删除 proxy_pool 失败")?;
+        Ok(changed > 0)
     }
 
     pub fn count(&self) -> Result<i64> {
@@ -220,6 +366,18 @@ impl Store {
     }
 }
 
+/// 代理池里的一条记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEntry {
+    pub id: i64,
+    pub line: String,
+    pub enabled: bool,
+    pub note: String,
+    pub last_status: String,
+    pub last_checked_at: i64,
+    pub created_at: i64,
+}
+
 fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account {
         email: row.get(0)?,
@@ -228,8 +386,16 @@ fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         totp_secret: row.get(3)?,
         cookies: row.get(4)?,
         status: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        plan_type: row.get(6)?,
+        plan_display: row.get(7)?,
+        is_trial: row.get::<_, i64>(8)? != 0,
+        trial_state: row.get(9)?,
+        eligible_new_user: row.get::<_, i64>(10)? != 0,
+        has_discount: row.get::<_, i64>(11)? != 0,
+        discount_summary: row.get(12)?,
+        plan_updated_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 

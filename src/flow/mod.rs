@@ -63,7 +63,8 @@ pub const DEFAULT_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 /// | 变量 | 含义 | 缺省 |
 /// |---|---|---|
 /// | `SENTINEL_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | 代理（`host:port` 或 `http://user:pass@host:port`） | 直连 |
-/// | `REG_MAIL_API_BASE_URL` | 邮箱 API 基地址（必填，`https://`） | 未配置 → 不能 `--live` |
+/// | `REG_MAIL_ENTRY` | 固定邮箱 `email----code_url`（跳过领邮箱 API） | 空 → 走领邮箱 API |
+/// | `REG_MAIL_API_BASE_URL` | 邮箱 API 基地址（领邮箱模式必填，`https://`） | 未配置且无 `REG_MAIL_ENTRY` → 不能 `--live` |
 /// | `REG_MAIL_API_TOKEN` | 邮箱 API bearer token（可选） | 空 → 不发鉴权头 |
 /// | `REG_MAIL_ALLOW_INSECURE` | `1` 时放行回环 `http://`（本地自建 / mock） | `0` |
 /// | `SENTINEL_ENABLE_2FA` | 注册后是否绑 TOTP | `false` |
@@ -84,6 +85,12 @@ pub const DEFAULT_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 pub struct RegisterConfig {
     pub proxy: Option<String>,
     pub email_api: Option<email::EmailApiConfig>,
+    /// 固定邮箱列表（`REG_MAIL_ENTRY` / `REG_MAIL_ENTRY_FILE`），每条 `email----code_url`。
+    /// 与 [`Self::email_api`] 同时存在时以本项为准；第 i 个账号用第 i 条。
+    pub mail_entries: Vec<email::FixedMailbox>,
+    /// 代理池（`SENTINEL_PROXY_POOL` / `SENTINEL_PROXY_POOL_FILE`），第 i 个账号用第 i 条
+    /// （数量不够时按取模轮转）。为空则用 [`Self::proxy`]。
+    pub proxy_pool: Vec<String>,
     pub enable_2fa: bool,
     pub count: usize,
     pub db_path: PathBuf,
@@ -104,7 +111,9 @@ impl Default for RegisterConfig {
         Self {
             proxy: None,
             email_api: None,
-            enable_2fa: false,
+            mail_entries: Vec::new(),
+            proxy_pool: Vec::new(),
+            enable_2fa: true,
             count: 1,
             db_path: PathBuf::from("data/sentinel-rs.db"),
             otp_max_wait_secs: 180,
@@ -161,6 +170,19 @@ impl RegisterConfig {
         }
 
         let email_api = email::EmailApiConfig::from_lookup(&lookup)?;
+        let mail_entries = email::entries_from_lookup(&lookup)?;
+        let db_path = get("SENTINEL_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data/sentinel-rs.db"));
+        let proxy_pool = parse_proxy_pool(&get, &db_path)?;
+
+        if !mail_entries.is_empty() && email_api.is_some() {
+            warn!(
+                "同时设置了 {} 和 {}，按固定邮箱执行（跳过领邮箱 API）",
+                email::ENV_ENTRY,
+                email::ENV_BASE_URL
+            );
+        }
 
         let dry_run = match get("SENTINEL_LIVE_REGISTER") {
             Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
@@ -170,17 +192,18 @@ impl RegisterConfig {
         Ok(Self {
             proxy,
             email_api,
-            enable_2fa: matches!(
-                get("SENTINEL_ENABLE_2FA")
-                    .unwrap_or_default()
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "1" | "true" | "yes" | "on"
-            ),
+            mail_entries,
+            proxy_pool,
+            // 2FA 默认开启；显式 `SENTINEL_ENABLE_2FA=0/false/off/no` 才关。
+            enable_2fa: match get("SENTINEL_ENABLE_2FA") {
+                Some(v) => matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                ),
+                None => true,
+            },
             count,
-            db_path: get("SENTINEL_DB_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("data/sentinel-rs.db")),
+            db_path,
             otp_max_wait_secs,
             otp_poll_interval_secs,
             user_agent: get("SENTINEL_USER_AGENT")
@@ -256,16 +279,49 @@ impl RegisterConfig {
         }
     }
 
+    /// 第 `index` 个账号用的代理：代理池轮转优先，否则全局 `SENTINEL_PROXY`。
+    pub fn proxy_for(&self, index: usize) -> Option<String> {
+        if self.proxy_pool.is_empty() {
+            return self.proxy.clone();
+        }
+        Some(self.proxy_pool[index % self.proxy_pool.len()].clone())
+    }
+
+    /// 第 `index` 个账号用的固定邮箱。`None` = 走领邮箱 API。
+    pub fn mailbox_for(&self, index: usize) -> Option<&email::FixedMailbox> {
+        if self.mail_entries.is_empty() {
+            None
+        } else {
+            self.mail_entries.get(index % self.mail_entries.len())
+        }
+    }
+
     /// 真实链路必须有的东西；dry-run 不做强制（沙箱里也能跑 `register -n 1`）。
     pub fn require_live_prerequisites(&self) -> Result<()> {
+        // 固定邮箱是一个号一条：数量不够就别跑，跑到一半撞"已有账号"更亏。
+        // 放在这里而不是 from_lookup，是因为 `-n/--count` 是解析完配置后才覆盖 count 的。
+        if !self.mail_entries.is_empty() && self.count > self.mail_entries.len() {
+            bail!(
+                "固定邮箱只有 {} 个，注册数量 {} 超出；请补齐 {}（每行一条 email----code_url）\
+                 或把 -n 调成 {}",
+                self.mail_entries.len(),
+                self.count,
+                email::ENV_ENTRY_FILE,
+                self.mail_entries.len()
+            );
+        }
         if self.dry_run {
             return Ok(());
         }
-        if self.email_api.is_none() {
+        if self.email_api.is_none() && self.mail_entries.is_empty() {
             bail!(
-                "缺少邮箱 API 配置：请设置 REG_MAIL_API_BASE_URL（必填，https://），\
-                 需要鉴权时再设 REG_MAIL_API_TOKEN；本地自建 / mock 服务另需 \
-                 REG_MAIL_ALLOW_INSECURE=1"
+                "缺少邮箱配置：设置 {}（固定邮箱，格式 email----code_url），\
+                 或 {}（领邮箱 API，必填，https://）；\
+                 需要鉴权时再设 {}；本地自建 / mock 服务另需 {}",
+                email::ENV_ENTRY,
+                email::ENV_BASE_URL,
+                email::ENV_TOKEN,
+                email::ENV_ALLOW_INSECURE
             );
         }
         Ok(())
@@ -279,6 +335,64 @@ fn parse_u64(get: &dyn Fn(&str) -> Option<String>, key: &str, default: u64) -> R
             .with_context(|| format!("{key} 解析失败（需要非负整数）: {raw:?}")),
         None => Ok(default),
     }
+}
+
+/// 代理池：`SENTINEL_PROXY_POOL`（换行 / 分号分隔）+ `SENTINEL_PROXY_POOL_FILE`（每行一条）。
+///
+/// 两处都没配时，自动从 SQLite 的 `proxy_pool` 表读**启用中**的代理——也就是
+/// 控制台里配的那份，注册时直接生效。
+fn parse_proxy_pool(
+    get: &dyn Fn(&str) -> Option<String>,
+    db_path: &std::path::Path,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut explicit = false;
+    if let Some(raw) = get("SENTINEL_PROXY_POOL") {
+        explicit = true;
+        for line in raw
+            .split(['\n', '\r', ';'])
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            out.push(http::normalize_proxy_line(line)?);
+        }
+    }
+    if let Some(path) = get("SENTINEL_PROXY_POOL_FILE")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        explicit = true;
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("读取 SENTINEL_PROXY_POOL_FILE 失败: {path}"))?;
+        for line in text
+            .split(['\n', '\r'])
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            out.push(http::normalize_proxy_line(line)?);
+        }
+    }
+    if !explicit && db_path.exists() {
+        match store::Store::open(db_path) {
+            Ok(db) => {
+                db.init()?;
+                for entry in db.list_proxies(true)? {
+                    if let Ok(line) = http::normalize_proxy_line(&entry.line) {
+                        out.push(line);
+                    }
+                }
+                if !out.is_empty() {
+                    info!(
+                        "代理池：从数据库读取 {} 条启用代理（{}）",
+                        out.len(),
+                        db_path.display()
+                    );
+                }
+            }
+            Err(err) => warn!("读取数据库代理池失败: {err:#}"),
+        }
+    }
+    Ok(out)
 }
 
 // ─────────────────────────── sentinel token 源 ───────────────────────────
@@ -327,6 +441,9 @@ pub struct RegistrationOutcome {
     pub account_id: Option<i64>,
     /// dry-run 打印的请求计划（method + url + label）。
     pub plan: Vec<String>,
+    /// 本次会话 HTTP 上行 / 下行字节（粗算，不含 TLS 开销）。
+    pub traffic_sent: u64,
+    pub traffic_recv: u64,
 }
 
 /// 一次注册里的随机身份（邮箱来自邮箱 API，密码/设备 id 本地生成）。
@@ -366,19 +483,24 @@ impl RegisterIdentity {
 /// 进来第一件事是**定下本次的设备指纹**：UA / `accept-language` / client hints /
 /// token profile / TLS emulation 全部由这一份派生，保证一个账号一套且完全自洽。
 pub async fn register_once(cfg: &RegisterConfig) -> Result<RegistrationOutcome> {
+    register_once_at(cfg, 0).await
+}
+
+/// 按账号序号注册（第 `index` 个邮箱 / 第 `index` 个代理，均从 0 起）。
+pub async fn register_once_at(cfg: &RegisterConfig, index: usize) -> Result<RegistrationOutcome> {
     let cfg = cfg.clone().with_fingerprint();
     log_fingerprint(&cfg);
     if cfg.dry_run {
-        return register_once_with(&cfg, &MissingSentinelSource).await;
+        return register_once_at_with(&cfg, &MissingSentinelSource, index).await;
     }
     let source = sentinel::live_source(
         &cfg.user_agent,
         &cfg.accept_language,
-        cfg.proxy.as_deref(),
+        cfg.proxy_for(index).as_deref(),
         cfg.fingerprint.as_ref(),
     )
     .context("初始化 sentinel token 源失败")?;
-    register_once_with(&cfg, &source).await
+    register_once_at_with(&cfg, &source, index).await
 }
 
 /// 打一行本次实际使用的设备画像（`SENTINEL_LOG=info` 默认可见）。
@@ -394,11 +516,20 @@ pub async fn register_once_with(
     cfg: &RegisterConfig,
     sentinel: &dyn SentinelTokenSource,
 ) -> Result<RegistrationOutcome> {
+    register_once_at_with(cfg, sentinel, 0).await
+}
+
+/// 可注入 token 源 + 指定账号序号的版本。
+pub async fn register_once_at_with(
+    cfg: &RegisterConfig,
+    sentinel: &dyn SentinelTokenSource,
+    index: usize,
+) -> Result<RegistrationOutcome> {
     cfg.require_live_prerequisites()?;
 
     if cfg.dry_run {
         let identity = RegisterIdentity::placeholder();
-        let steps = build_plan_steps(cfg, &identity);
+        let steps = build_plan_steps_at(cfg, &identity, index);
         let http_count = steps.iter().filter(|step| step.is_http()).count();
         info!(
             "dry-run：仅构造请求，不会联网（共 {} 步，其中 {http_count} 个 HTTP 请求）",
@@ -413,7 +544,7 @@ pub async fn register_once_with(
         });
     }
 
-    live_register(cfg, sentinel).await
+    live_register(cfg, sentinel, index).await
 }
 
 /// 只验证 authorize 会话是否建得起来：warmup → signin → authorize init。
@@ -463,6 +594,7 @@ pub async fn preflight_authorize(cfg: &RegisterConfig) -> Result<Vec<String>> {
         .unwrap_or(&init.landing_url)
         .to_string();
     let verdict = auth::classify_landing(&init.landing_url, auth::Intent::Signup);
+    let (traffic_sent, traffic_recv) = http.traffic();
 
     Ok(vec![
         format!("warmup          : ok（第 {} 次）oai-did={}…", warm.attempts, &warm.device_id[..warm.device_id.len().min(8)]),
@@ -470,6 +602,12 @@ pub async fn preflight_authorize(cfg: &RegisterConfig) -> Result<Vec<String>> {
         format!("authorize 落地  : {landing}"),
         format!("判定            : {verdict:?}"),
         format!("最终状态码      : {}", init.final_status),
+        format!(
+            "流量            : 上行≈{:.0}KB 下行≈{:.0}KB 合计≈{:.0}KB",
+            traffic_sent as f64 / 1024.0,
+            traffic_recv as f64 / 1024.0,
+            (traffic_sent + traffic_recv) as f64 / 1024.0
+        ),
     ])
 }
 
@@ -477,22 +615,19 @@ pub async fn preflight_authorize(cfg: &RegisterConfig) -> Result<Vec<String>> {
 async fn live_register(
     cfg: &RegisterConfig,
     sentinel: &dyn SentinelTokenSource,
+    index: usize,
 ) -> Result<RegistrationOutcome> {
     use auth::Intent;
 
     cfg.require_live_prerequisites()?;
-    let email_api = cfg
-        .email_api
-        .as_ref()
-        .context("缺少邮箱 API 配置（REG_MAIL_API_BASE_URL）")?;
 
+    let proxy = cfg.proxy_for(index);
     let http = http::Client::build_with_emulation(
         &cfg.user_agent,
-        cfg.proxy.as_deref(),
+        proxy.as_deref(),
         http::RetryPolicy::default(),
         cfg.emulation_profile(),
     )?;
-    let mail = email::MailApiClient::new(&http, email_api.clone());
 
     // 0) warmup：GET chatgpt.com/api/auth/csrf —— 种 oai-did。
     //    Python run_register 的第一件事，且必须在领邮箱之前拦掉：没有 oai-did 的会话
@@ -501,11 +636,32 @@ async fn live_register(
     let probe = cfg.auth_builder("");
     let warm = authorize::warmup(&http, &probe).await?;
 
-    // 1) 建/领邮箱
-    let mailbox = mail
-        .create_mailbox(None, None)
-        .await
-        .context("创建邮箱失败")?;
+    // 1) 邮箱：固定邮箱列表里按序号取，否则走领邮箱 API
+    let fixed = cfg.mailbox_for(index);
+    let mailbox = match (fixed, &cfg.email_api) {
+        (Some(fixed), _) => {
+            info!(
+                "[email] 固定邮箱: {}（跳过领邮箱 API）",
+                fixed.email
+            );
+            email::Mailbox {
+                email: fixed.email.clone(),
+                code_url: fixed.code_url.clone(),
+                expires_at: None,
+            }
+        }
+        (None, Some(api)) => {
+            let mail = email::MailApiClient::new(&http, api.clone());
+            mail.create_mailbox(None, None)
+                .await
+                .context("创建邮箱失败")?
+        }
+        (None, None) => bail!(
+            "缺少邮箱配置：{}（email----code_url）或 {}（领邮箱 API）",
+            email::ENV_ENTRY,
+            email::ENV_BASE_URL
+        ),
+    };
     let mut identity = RegisterIdentity::new(mailbox.email.clone());
     // oai-did 必须用 warmup 种下的那个（Python `_resolve_device_id`：cookie 优先，
     // 凭空 uuid4 服务端不认这个会话 —— 那正是 409 invalid_state 的上游根因）
@@ -623,14 +779,14 @@ async fn live_register(
     info!("[6/10] OTP 已发送");
 
     // 6) 取码
-    let code = mail
-        .poll_otp(
-            &mailbox.code_url,
-            cfg.otp_max_wait_secs,
-            cfg.otp_poll_interval_secs,
-        )
-        .await
-        .context("等待邮箱验证码失败")?;
+    let code = email::poll_otp(
+        &http,
+        &mailbox.code_url,
+        cfg.otp_max_wait_secs,
+        cfg.otp_poll_interval_secs,
+    )
+    .await
+    .context("等待邮箱验证码失败")?;
     info!("已取得邮箱验证码");
 
     // 8) 验证 OTP（该 flow 服务端要求 SO token）
@@ -691,6 +847,8 @@ async fn live_register(
 
     // 10) 落库（access_token / cookies 都来自上一步；账号在 user/register 时已写过
     //     pending_otp，这里按 email upsert 更新成最终状态）
+    //     已有行的套餐字段原样带回去，别被这次 upsert 抹掉。
+    let base = store.get_account(&identity.email)?.unwrap_or_default();
     let account = store::Account {
         email: identity.email.clone(),
         password: identity.password.clone(),
@@ -705,10 +863,26 @@ async fn live_register(
         } else {
             "registered".to_string()
         },
-        created_at: store::now_ts(),
+        plan_type: base.plan_type,
+        plan_display: base.plan_display,
+        is_trial: base.is_trial,
+        trial_state: base.trial_state,
+        eligible_new_user: base.eligible_new_user,
+        has_discount: base.has_discount,
+        discount_summary: base.discount_summary,
+        plan_updated_at: base.plan_updated_at,
+        created_at: base.created_at,
         updated_at: store::now_ts(),
     };
     let account_id = store.save_account(&account)?;
+
+    let (traffic_sent, traffic_recv) = http.traffic();
+    info!(
+        "[traffic] 上行≈{:.0}KB 下行≈{:.0}KB 合计≈{:.0}KB",
+        traffic_sent as f64 / 1024.0,
+        traffic_recv as f64 / 1024.0,
+        (traffic_sent + traffic_recv) as f64 / 1024.0
+    );
 
     Ok(RegistrationOutcome {
         dry_run: false,
@@ -718,6 +892,8 @@ async fn live_register(
         totp_secret,
         account_id: Some(account_id),
         plan: Vec::new(),
+        traffic_sent,
+        traffic_recv,
     })
 }
 
@@ -1023,8 +1199,358 @@ fn sentinel_steps(flow: &str, device_id: &str, accept_language: &str) -> Vec<Pla
     ]
 }
 
+/// 用邮箱+密码重新登录，让会话变成"最近认证"（MFA enroll 的硬门槛）。
+///
+/// 复用注册链路的 authorize 半程：warmup → signin → authorize 落地 →
+/// `password/verify` → 收尾（callback → chatgpt session）拿新的 access_token。
+pub async fn relogin(
+    cfg: &RegisterConfig,
+    sentinel: &dyn SentinelTokenSource,
+    http: &http::Client,
+    email: &str,
+    password: &str,
+) -> Result<auth::OAuthHandoff> {
+    let probe = cfg.auth_builder("");
+    let warm = authorize::warmup(http, &probe).await?;
+    let builder = cfg.auth_builder(&warm.device_id);
+
+    let auth_url = authorize::fetch_authorize_url(
+        http,
+        &builder,
+        email,
+        &warm.csrf_token,
+        &warm.device_id,
+    )
+    .await?;
+    let init = authorize::auth_oauth_init(http, &builder, &auth_url, &warm.device_id).await?;
+    info!("[login] authorize 落地: {}", init.landing_url);
+
+    // 密码页导航（建立页面状态；password/verify 409 时也有兜底作用）
+    if let Err(err) = http.execute(&builder.login_password_page()).await {
+        warn!("[login] 打开密码页失败（继续尝试 password/verify）: {err:#}");
+    }
+
+    let st = sentinel.token("authorize_continue", &warm.device_id)?;
+    let resp = http.execute(&builder.login_password_verify(password, &st)).await?;
+    let body = http::body_string(&resp);
+    if !resp.is_success() {
+        bail!(
+            "password/verify 失败: HTTP {} {}",
+            resp.status,
+            body.chars().take(300).collect::<String>()
+        );
+    }
+
+    let continue_url = continue_url_from_json(body);
+    debug!("[login] continue_url={continue_url}");
+    Ok(complete_oauth(http, &builder, &continue_url).await)
+}
+
+/// 从 password/verify 的 JSON 里找后续跳转地址（服务端字段名不固定）。
+fn continue_url_from_json(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    for key in ["continue_url", "continueUrl", "url", "redirect_url"] {
+        if let Some(url) = value.get(key).and_then(|v| v.as_str()) {
+            if !url.trim().is_empty() {
+                return url.trim().to_string();
+            }
+        }
+    }
+    if let Some(url) = value
+        .get("data")
+        .and_then(|data| data.get("continue_url"))
+        .and_then(|v| v.as_str())
+    {
+        return url.trim().to_string();
+    }
+    String::new()
+}
+
+/// 一次 enroll 尝试的结果。
+enum MfaAttempt {
+    Enrolled(String),
+    /// 401 `recent_auth_required`：必须先重新认证。
+    Reauth,
+    Failed(String),
+}
+
+/// enroll → 本地算 TOTP → activate。
+async fn try_enroll(
+    http: &http::Client,
+    builder: &auth::AuthRequestBuilder,
+    access_token: &str,
+) -> Result<MfaAttempt> {
+    let st = SentinelToken {
+        token: String::new(),
+        so_token: None,
+    };
+    let resp = http
+        .execute(&twofa::enroll_spec(builder, access_token, &st))
+        .await?;
+    let body = http::body_string(&resp).to_string();
+    if resp.status == 401 && body.contains("recent_auth_required") {
+        return Ok(MfaAttempt::Reauth);
+    }
+    if !resp.is_success() {
+        return Ok(MfaAttempt::Failed(format!(
+            "mfa/enroll HTTP {} {}",
+            resp.status,
+            body.chars().take(160).collect::<String>()
+        )));
+    }
+    let enrolled = twofa::parse_enroll(&body)?;
+    let code = twofa::totp_now(&enrolled.secret)?;
+    let resp = http
+        .execute(&twofa::activate_spec(
+            builder,
+            access_token,
+            &code,
+            &enrolled.session_id,
+            &st,
+        ))
+        .await?;
+    if !resp.is_success() {
+        return Ok(MfaAttempt::Failed(format!(
+            "activate HTTP {} {}",
+            resp.status,
+            http::body_string(&resp).chars().take(160).collect::<String>()
+        )));
+    }
+    Ok(MfaAttempt::Enrolled(enrolled.secret))
+}
+
+/// 补绑 2FA 的单账号结果。
+#[derive(Debug, Clone)]
+pub struct TwoFaOutcome {
+    pub email: String,
+    pub status: String,
+    pub secret: Option<String>,
+}
+
+/// 给库里已注册的账号补绑 TOTP（只依赖 `access_token`，不需要密码/邮箱）。
+///
+/// 流程对齐 [`live_register`] 里的 2FA 分支：`mfa_info` → 已绑就跳过 →
+/// `mfa/enroll` → 用 secret 现算 TOTP → `mfa/user/activate_enrollment` → 落库。
+pub async fn enable_2fa(
+    cfg: &RegisterConfig,
+    only: Option<&str>,
+) -> Result<Vec<TwoFaOutcome>> {
+    let store = store::Store::open(&cfg.db_path)?;
+    store.init()?;
+    let accounts = store.list_accounts(10_000)?;
+
+    let mut outcomes = Vec::new();
+    for (index, account) in accounts.iter().enumerate() {
+        if let Some(want) = only {
+            if !account.email.eq_ignore_ascii_case(want.trim()) {
+                continue;
+            }
+        }
+        if account.access_token.trim().is_empty() {
+            outcomes.push(TwoFaOutcome {
+                email: account.email.clone(),
+                status: "跳过：没有 access_token".to_string(),
+                secret: None,
+            });
+            continue;
+        }
+        if !account.totp_secret.trim().is_empty() {
+            outcomes.push(TwoFaOutcome {
+                email: account.email.clone(),
+                status: "跳过：本地已记录 TOTP".to_string(),
+                secret: Some(account.totp_secret.clone()),
+            });
+            continue;
+        }
+
+        let proxy = cfg.proxy_for(index);
+        let http = http::Client::build_with_emulation(
+            &cfg.user_agent,
+            proxy.as_deref(),
+            http::RetryPolicy::default(),
+            cfg.emulation_profile(),
+        )?;
+        let builder = cfg.auth_builder("");
+        let st = SentinelToken {
+            token: String::new(),
+            so_token: None,
+        };
+        let access_token = account.access_token.trim();
+
+        // 1) 已绑就跳过（secret 取不回来，重复 enroll 也只会报错）
+        let resp = match http
+            .execute(&twofa::mfa_info_spec(&builder, access_token, &st))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                outcomes.push(TwoFaOutcome {
+                    email: account.email.clone(),
+                    status: format!("失败：mfa_info 请求失败: {err:#}"),
+                    secret: None,
+                });
+                continue;
+            }
+        };
+        if !resp.is_success() {
+            outcomes.push(TwoFaOutcome {
+                email: account.email.clone(),
+                status: format!(
+                    "失败：mfa_info HTTP {} {}",
+                    resp.status,
+                    http::body_string(&resp).chars().take(160).collect::<String>()
+                ),
+                secret: None,
+            });
+            continue;
+        }
+        let info = match twofa::parse_mfa_info(http::body_string(&resp)) {
+            Ok(info) => info,
+            Err(err) => {
+                outcomes.push(TwoFaOutcome {
+                    email: account.email.clone(),
+                    status: format!("失败：mfa_info 响应解析失败: {err:#}"),
+                    secret: None,
+                });
+                continue;
+            }
+        };
+        if twofa::already_enrolled(&info) {
+            outcomes.push(TwoFaOutcome {
+                email: account.email.clone(),
+                status: "跳过：服务端已启用 TOTP".to_string(),
+                secret: None,
+            });
+            continue;
+        }
+
+        // 2) enroll：401 recent_auth_required 时先用密码重新登录再重试
+        let mut access_token = account.access_token.trim().to_string();
+        let mut attempt = match try_enroll(&http, &builder, &access_token).await {
+            Ok(attempt) => attempt,
+            Err(err) => {
+                outcomes.push(TwoFaOutcome {
+                    email: account.email.clone(),
+                    status: format!("失败：enroll 请求失败: {err:#}"),
+                    secret: None,
+                });
+                continue;
+            }
+        };
+        if matches!(attempt, MfaAttempt::Reauth) {
+            info!("[2fa] {} 需要最近认证，用密码重新登录…", account.email);
+            if account.password.trim().is_empty() {
+                outcomes.push(TwoFaOutcome {
+                    email: account.email.clone(),
+                    status: "失败：库里没有密码，无法重新认证".to_string(),
+                    secret: None,
+                });
+                continue;
+            }
+            let source = sentinel::live_source(
+                &cfg.user_agent,
+                &cfg.accept_language,
+                proxy.as_deref(),
+                cfg.fingerprint.as_ref(),
+            )
+            .context("初始化 sentinel token 源失败")?;
+            let handoff = match relogin(cfg, &source, &http, &account.email, account.password.trim()).await {
+                Ok(handoff) => handoff,
+                Err(err) => {
+                    outcomes.push(TwoFaOutcome {
+                        email: account.email.clone(),
+                        status: format!("失败：重新登录失败: {err:#}"),
+                        secret: None,
+                    });
+                    continue;
+                }
+            };
+            if handoff.access_token.trim().is_empty() {
+                outcomes.push(TwoFaOutcome {
+                    email: account.email.clone(),
+                    status: format!(
+                        "失败：重新登录成功但没拿到 access_token（continue={}）",
+                        handoff.continue_url
+                    ),
+                    secret: None,
+                });
+                continue;
+            }
+            access_token = handoff.access_token.clone();
+            // 新会话的 cookie 也一起换掉，后面 activate 还用得上
+            let cookies = merge_cookie_headers(&[
+                http.cookie_header_for(auth::AUTH_BASE),
+                http.cookie_header_for(auth::CHATGPT_BASE),
+            ]);
+            let mut refreshed = account.clone();
+            refreshed.access_token = access_token.clone();
+            if !cookies.is_empty() {
+                refreshed.cookies = cookies;
+            }
+            refreshed.updated_at = store::now_ts();
+            store.save_account(&refreshed)?;
+            attempt = match try_enroll(&http, &builder, &access_token).await {
+                Ok(attempt) => attempt,
+                Err(err) => {
+                    outcomes.push(TwoFaOutcome {
+                        email: account.email.clone(),
+                        status: format!("失败：重新登录后 enroll 失败: {err:#}"),
+                        secret: None,
+                    });
+                    continue;
+                }
+            };
+        }
+
+        let secret = match attempt {
+            MfaAttempt::Enrolled(secret) => secret,
+            MfaAttempt::Reauth => {
+                outcomes.push(TwoFaOutcome {
+                    email: account.email.clone(),
+                    status: "失败：重新登录后仍然要求再次认证".to_string(),
+                    secret: None,
+                });
+                continue;
+            }
+            MfaAttempt::Failed(message) => {
+                outcomes.push(TwoFaOutcome {
+                    email: account.email.clone(),
+                    status: format!("失败：{message}"),
+                    secret: None,
+                });
+                continue;
+            }
+        };
+
+        // 3) 落库（save_account 按 email upsert）
+        let mut updated = account.clone();
+        updated.access_token = access_token;
+        updated.totp_secret = secret.clone();
+        updated.updated_at = store::now_ts();
+        store.save_account(&updated)?;
+        outcomes.push(TwoFaOutcome {
+            email: account.email.clone(),
+            status: "已启用 TOTP".to_string(),
+            secret: Some(secret),
+        });
+    }
+
+    Ok(outcomes)
+}
+
 /// 构造 dry-run 的**完整**计划（含 sentinel 本地步骤，纯函数，不发请求）。
 pub fn build_plan_steps(cfg: &RegisterConfig, identity: &RegisterIdentity) -> Vec<PlanStep> {
+    build_plan_steps_at(cfg, identity, 0)
+}
+
+/// 同上，按账号序号取对应的固定邮箱。
+pub fn build_plan_steps_at(
+    cfg: &RegisterConfig,
+    identity: &RegisterIdentity,
+    index: usize,
+) -> Vec<PlanStep> {
     // 指纹若已在配置里（register_once / main 预先生成），计划里的头就跟着指纹走。
     let builder = cfg.auth_builder(&identity.device_id);
     let st = SentinelToken {
@@ -1036,9 +1562,21 @@ pub fn build_plan_steps(cfg: &RegisterConfig, identity: &RegisterIdentity) -> Ve
 
     let mut steps: Vec<PlanStep> = Vec::new();
 
-    // 邮箱：有配置就用真实端点，没有就写占位，方便看清楚缺哪一段。
-    match &cfg.email_api {
-        Some(api) => {
+    // 邮箱：固定邮箱 / 领邮箱 API / 未配置占位，三种都写清楚。
+    match (cfg.mailbox_for(index), &cfg.email_api) {
+        (Some(fixed), _) => {
+            steps.push(PlanStep::local(
+                "email.fixed_mailbox",
+                format!(
+                    "固定邮箱 {}（跳过领邮箱 API，不消耗新地址）",
+                    fixed.email
+                ),
+            ));
+            steps.push(PlanStep::Http(email::inbox_spec(&email::redact_url(
+                &fixed.code_url,
+            ))));
+        }
+        (None, Some(api)) => {
             let mail = email::MailApiClient::new_offline(api.clone());
             steps.push(PlanStep::Http(mail.health_spec()));
             steps.push(PlanStep::Http(mail.create_mailbox_spec(None, None)));
@@ -1046,14 +1584,14 @@ pub fn build_plan_steps(cfg: &RegisterConfig, identity: &RegisterIdentity) -> Ve
                 mail.inbox_spec("<code_url from create_mailbox response>"),
             ));
         }
-        None => {
+        (None, None) => {
             steps.push(PlanStep::Http(http::RequestSpec::get(
                 "email.health",
-                "<未配置邮箱 API：设置 REG_MAIL_API_BASE_URL>/health",
+                "<未配置邮箱：设置 REG_MAIL_ENTRY 或 REG_MAIL_API_BASE_URL>/health",
             )));
             steps.push(PlanStep::Http(http::RequestSpec::post_json(
                 "email.create_mailbox",
-                "<未配置邮箱 API：POST {REG_MAIL_API_BASE_URL}/mailboxes>",
+                "<未配置邮箱：POST {REG_MAIL_API_BASE_URL}/mailboxes>",
                 None,
                 None,
             )));

@@ -1,0 +1,7 @@
+# 代理池示例：复制成 proxy.txt 后填真实数据（proxy.txt 已被 .gitignore 忽略）
+# 支持三种行格式：
+#   host:port
+#   host:port:user:pass
+#   scheme://user:pass@host:port
+proxy.example.com:6666:userId-0000-session-abc-sessTime-20:YOUR_PASSWORD
+proxy.example.com:6666:userId-0000-session-def-sessTime-20:YOUR_PASSWORD
