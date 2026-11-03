@@ -292,7 +292,9 @@ $("accounts-body").addEventListener("click", async (ev) => {
   try {
     const data = await post("/api/accounts/refresh", { id: Number(id) });
     const r = data.results?.[0];
-    toast(r?.ok ? `套餐已更新：${r.plan?.plan_display || "-"}` : `刷新失败：${r?.error || "未知"}`);
+    toast(r?.ok
+      ? `套餐已更新：${r.plan?.plan_display || "-"}（下行 ${((r.plan?.body_bytes || 0) / 1024).toFixed(1)} KB · via ${r.plan?.proxy || "?"}）`
+      : `刷新失败：${r?.error || "未知"}`);
     await load();
   } catch (e) { toast("刷新失败：" + e.message); }
   finally { ev.target.disabled = false; }
@@ -304,7 +306,8 @@ $("refresh-all").addEventListener("click", async (ev) => {
   try {
     const data = await post("/api/accounts/refresh", {});
     const ok = (data.results || []).filter((r) => r.ok).length;
-    toast(`套餐刷新完成：成功 ${ok} / ${(data.results || []).length}`);
+    const kb = ((data.body_bytes || 0) / 1024).toFixed(1);
+    toast(`套餐刷新完成：成功 ${ok} / ${(data.results || []).length}，下行 ${kb} KB`);
     await load();
   } catch (e) { toast("刷新失败：" + e.message); }
   finally { ev.target.disabled = false; ev.target.textContent = "刷新套餐"; }

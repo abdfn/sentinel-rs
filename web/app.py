@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import sqlite3
@@ -196,18 +197,49 @@ def read_proxies(conn: sqlite3.Connection) -> list[dict]:
 
 # ─────────────────────────── 套餐 ───────────────────────────
 
-def fetch_plan(token: str) -> dict:
+def proxy_url(line: str) -> str:
+    """代理池行 → urllib 用的代理 URL。"""
+    line = line.strip()
+    if "://" in line:
+        return line
+    parts = line.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{host}:{port}"
+    if len(parts) == 2:
+        return f"http://{parts[0]}:{parts[1]}"
+    return line
+
+
+def proxy_label(line: str) -> str:
+    info = parse_proxy_line(line)
+    return f'{info["host"]}:{info["port"]}/{info["session"]}' if info["valid"] else line[:24]
+
+
+def fetch_plan(token: str, proxy: str) -> dict:
+    """查套餐。`proxy` 必填——不发直连请求。"""
+    if not proxy:
+        raise RuntimeError("未提供代理（拒绝直连）")
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
     req = urllib.request.Request(
         PLAN_URL,
         headers={
             "authorization": "Bearer " + token,
             "accept": "application/json",
+            "accept-encoding": "gzip",
             "user-agent": UA,
             "referer": "https://chatgpt.com/",
         },
     )
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        data = json.loads(resp.read().decode())
+    with opener.open(req, timeout=30) as resp:
+        raw = resp.read()
+        encoding = (resp.headers.get("content-encoding") or "").lower()
+        body_bytes = len(raw)
+        if "gzip" in encoding:
+            raw = gzip.decompress(raw)
+        data = json.loads(raw.decode())
 
     accounts = data.get("accounts") or {}
     entry = None
@@ -254,6 +286,7 @@ def fetch_plan(token: str) -> dict:
         "trial_present": trial not in (None, {}, []),
         "has_discount": has_discount,
         "discount_summary": " | ".join(parts),
+        "body_bytes": body_bytes,
     }
 
 
@@ -403,40 +436,68 @@ class Handler(BaseHTTPRequestHandler):
                     + " order by id",
                     ((int(target),) if target else ()),
                 ).fetchall()
+                proxies = [
+                    row["line"]
+                    for row in conn.execute(
+                        "select line from proxy_pool where enabled = 1 order by id"
+                    ).fetchall()
+                ]
+                if not proxies:
+                    conn.close()
+                    return self._json(
+                        {"error": "代理池为空：请先在代理池添加并启用代理（本功能不走直连）"}, 400
+                    )
+
                 results = []
-                for r in rows:
+                total_bytes = 0
+                for index, r in enumerate(rows):
                     token = (r["access_token"] or "").strip()
                     if not token:
                         results.append({"id": r["id"], "email": r["email"], "ok": False,
                                         "error": "没有 access_token"})
                         continue
-                    try:
-                        plan = fetch_plan(token)
-                        conn.execute(
-                            "update accounts set plan_type=?, plan_display=?, is_trial=?, "
-                            "trial_state=?, eligible_new_user=?, has_discount=?, discount_summary=?, "
-                            "plan_updated_at=strftime('%s','now') where id=?",
-                            (
-                                plan["plan_type"],
-                                plan["plan_display"],
-                                1 if plan["is_trial"] else 0,
-                                plan["trial_state"],
-                                1 if plan["eligible_new_user"] else 0,
-                                1 if plan["has_discount"] else 0,
-                                plan["discount_summary"],
-                                r["id"],
-                            ),
-                        )
-                        results.append({"id": r["id"], "email": r["email"], "ok": True, "plan": plan})
-                    except urllib.error.HTTPError as err:
+
+                    # 按序号取代理；失败就顺延下一条（最多 3 条），绝不回落到直连
+                    plan = None
+                    last_error = ""
+                    used_proxy = ""
+                    for offset in range(min(3, len(proxies))):
+                        candidate = proxies[(index + offset) % len(proxies)]
+                        try:
+                            plan = fetch_plan(token, proxy_url(candidate))
+                            used_proxy = proxy_label(candidate)
+                            break
+                        except urllib.error.HTTPError as err:
+                            last_error = f"HTTP {err.code}"
+                        except Exception as err:
+                            last_error = f"{type(err).__name__}: {err}"
+
+                    if plan is None:
                         results.append({"id": r["id"], "email": r["email"], "ok": False,
-                                        "error": f"HTTP {err.code}"})
-                    except Exception as err:  # 网络/解析
-                        results.append({"id": r["id"], "email": r["email"], "ok": False,
-                                        "error": f"{type(err).__name__}: {err}"})
+                                        "error": f"代理均失败（{last_error}）"})
+                        continue
+
+                    plan["proxy"] = used_proxy
+                    conn.execute(
+                        "update accounts set plan_type=?, plan_display=?, is_trial=?, "
+                        "trial_state=?, eligible_new_user=?, has_discount=?, discount_summary=?, "
+                        "plan_updated_at=strftime('%s','now') where id=?",
+                        (
+                            plan["plan_type"],
+                            plan["plan_display"],
+                            1 if plan["is_trial"] else 0,
+                            plan["trial_state"],
+                            1 if plan["eligible_new_user"] else 0,
+                            1 if plan["has_discount"] else 0,
+                            plan["discount_summary"],
+                            r["id"],
+                        ),
+                    )
+                    results.append({"id": r["id"], "email": r["email"], "ok": True, "plan": plan})
+                    total_bytes += int(plan.get("body_bytes") or 0)
                 conn.commit()
                 conn.close()
-                return self._json({"ok": True, "results": results})
+                return self._json({"ok": True, "results": results, "body_bytes": total_bytes})
 
             conn.close()
             self._json({"error": "not found"}, 404)

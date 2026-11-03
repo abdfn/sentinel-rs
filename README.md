@@ -181,6 +181,8 @@ python web/app.py --port 8790
   只有 `entitlement.discount` / `applied_discounts` / `eligible_promo_campaigns` /
   `promo_data` / `entitlement.trial` 任一非空才显示「有优惠」（悬停看明细），否则显示「无」；
   另保留 `is_trial` 显示「试用中」。支持单号或一键刷新；
+- 套餐刷新**走代理池**（按账号序号取启用中的代理，失败顺延下一条，最多 3 条），
+  代理池为空时直接报错、**不回落到直连**；单次约 6 KB（gzip），10 个号约 60 KB；
 - **代理池**在页面上增删/启停，落 SQLite `proxy_pool` 表；注册时如果没显式配
   `SENTINEL_PROXY_POOL(_FILE)`，CLI 会**自动读取表里启用的代理**，按顺序分配给每个号；
 - 邮箱池会自动和账号池对账，标出"已注册 #id"与 2FA 状态；
